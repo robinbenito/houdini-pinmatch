@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 backup/
 .DS_Store
+tests/gui_*.png
+tests/gui_test_log.txt

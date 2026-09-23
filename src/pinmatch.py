@@ -169,13 +169,18 @@ def solve(rig, P, UV, free, anchor, start=None, weight=1.0, lock_roll=False,
     front = z > 1e-9
     zmin = 1e-6 * D
     steps = np.array([1e-6 * D] * 3 + [1e-5] * 3 + [1e-7])[idx]
-    cost, mu = r @ r, 1e-3
-    for it in range(iters):
+
+    def jacobian(x, r):
         J = np.empty((len(r), len(x)))
         for j in range(len(x)):
             xj = x.copy()
             xj[j] += steps[j]
             J[:, j] = (residual(xj)[0] - r) / steps[j]
+        return J
+
+    cost, mu = r @ r, 1e-3
+    for it in range(iters):
+        J = jacobian(x, r)
         A, g = J.T @ J, J.T @ r
         damp = np.diag(A) + 1e-12
         while mu < 1e12:
@@ -198,7 +203,8 @@ def solve(rig, P, UV, free, anchor, start=None, weight=1.0, lock_roll=False,
     uv, _ = rig.project(rig.world(q), q[6], P)
     err = rig.pixel_errors(uv, UV)
     err[~use] = np.nan
-    # Numerical rank of the data Jacobian with columns in pixel-equivalent units.
+    # Numerical rank of the data Jacobian (at the result) with columns in pixel-equivalent units.
+    J = jacobian(x, r)
     nd = 2 * len(Pu)
     colscale = np.linalg.norm(J[nd:nd + 7], axis=0) / lam + 1e-12
     sv = np.linalg.svd(J[:nd] / colscale, compute_uv=False)

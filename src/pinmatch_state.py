@@ -15,7 +15,8 @@ import hou
 import viewerstate.utils as su
 
 LABEL = "Camera Pin Matcher"
-PICK_PX = 12.0
+PICK_PX = 12.0          # pin grab radius
+SNAP_PX = 20.0          # point / edge snapping radius when creating pins
 ZOOM_RANGE = (0.25, 64.0)
 COLORS = {"active": (0.15, 1.0, 0.35), "inactive": (0.6, 0.6, 0.6), "locked": (1.0, 0.55, 0.1),
           "selected": (1.0, 0.95, 0.15), "ghost": (0.8, 0.4, 1.0)}
@@ -164,17 +165,39 @@ class State(object):
         return types.SimpleNamespace(cam=cam, rig=rig, W=rig.world(rig.q), f=rig.q[6],
                                      near=near * 4.0, far=near + (far - near) * 0.5)
 
+    def _measure_frame(self, fr):
+        """Where the camera frame sits in the viewport: uv -> pixels is affine (o + u*ex + v*ey) and
+        depends only on viewport size, resolution and the 2D window - not on the camera pose.
+        Measured while drawing (view and camera in sync) and reused by the event handlers, so live
+        solves never see a view that lags the camera by a redraw."""
+        P = fr.rig.unproject(fr.W, fr.f, [(0, 0), (1, 0), (0, 1)], fr.near)
+        s = np.array([tuple(self.vp.mapToScreen(_vec(p))) for p in P])
+        self.affine = (s[0], s[1] - s[0], s[2] - s[0])
+
     def _screen(self, fr, uv):
-        """Camera NDC -> viewport pixels (through whatever window the viewport shows)."""
-        P = fr.rig.unproject(fr.W, fr.f, uv, fr.near)
-        return np.array([tuple(self.vp.mapToScreen(_vec(p))) for p in P]).reshape(-1, 2)
+        """Camera NDC -> viewport pixels."""
+        if getattr(self, "affine", None) is None:
+            self._measure_frame(fr)
+        o, ex, ey = self.affine
+        uv = np.asarray(uv, float).reshape(-1, 2)
+        return o + uv[:, :1] * ex + uv[:, 1:] * ey
+
+    def _uv(self, fr, px):
+        self._screen(fr, [(0, 0)])
+        o, ex, ey = self.affine
+        return np.linalg.solve(np.column_stack([ex, ey]), np.asarray(px, float) - o)
 
     def _mouse(self, ui_event, fr):
         """-> (uv under the cursor in camera NDC, cursor position in viewport pixels)."""
-        o, d = ui_event.ray()
-        p = np.array(o) + np.array(d) * 10.0 * max(1.0, np.linalg.norm(np.array(o) - fr.W[3, :3]))
-        uv, _ = fr.rig.project(fr.W, fr.f, p[None])
-        return uv[0], self._screen(fr, uv)[0]
+        dev = ui_event.device()
+        p = hou.Vector4(dev.mouseX(), dev.mouseY(), 0.0, 1.0) * self.vp.windowToViewportTransform()
+        px = np.array([p[0], p[1]])
+        return self._uv(fr, px), px
+
+    def _ray(self, fr, uv):
+        """World ray through image point uv of the target camera."""
+        o = fr.W[3, :3]
+        return hou.Vector3(o), hou.Vector3(fr.rig.unproject(fr.W, fr.f, [uv], 1.0)[0] - o).normalized()
 
     def _pins(self):
         return self.drag["data"] if self.drag else self.pm.load_pins(self.node)
@@ -186,38 +209,66 @@ class State(object):
         i = int(np.argmin(d))
         return pins[i] if d[i] <= PICK_PX else None
 
-    def _hit_mesh(self, ui_event, mouse_px):
-        """Ray-cast the reference geometry, snap per the 'snap' parm. -> world anchor or None."""
+    def _hit_mesh(self, uv, fr, mouse_px):
+        """Anchor for a new pin under the cursor (world space), per the 'snap' parm, or None.
+
+        points: nearest mesh point within SNAP_PX in screen space - every point counts, as every
+                edge is visible in the wireframe display; hidden points only lose ties (+3 px).
+        edges:  closest point on the edges of the face under the cursor, if within SNAP_PX.
+        Otherwise (and in 'surface' mode) the first surface hit of the cursor ray.
+        """
         obj = self.pm.reference_object(self.node)
         if obj is None:
             return None
         geo = obj.displayNode().geometry()
         xf = obj.worldTransform()
         inv = xf.inverted()
-        o, d = ui_event.ray()
+        mode = self.node.parm("snap").evalAsString()
+        o, d = self._ray(fr, uv)
         o_l = o * inv
-        d_l = (o + d) * inv - o_l
-        pos, nml, uvw = hou.Vector3(), hou.Vector3(), hou.Vector3()
-        prim_num = geo.intersect(o_l, d_l, pos, nml, uvw)
+        pos = hou.Vector3()
+        prim_num = geo.intersect(o_l, (o + d) * inv - o_l, pos, hou.Vector3(), hou.Vector3())
+
+        def dist_px(P):
+            uv_p, z = fr.rig.project(fr.W, fr.f, P)
+            dd = np.linalg.norm(self._screen(fr, uv_p) - mouse_px, axis=1)
+            dd[z <= 0] = np.inf
+            return dd
+
+        if mode == "points":
+            M = self.pm._m(xf)
+            P = np.array(geo.pointFloatAttribValues("P")).reshape(-1, 3) @ M[:3, :3] + M[3, :3]
+            dist = dist_px(P)
+            best, best_rank = None, SNAP_PX
+            for i in np.argsort(dist)[:16]:
+                if dist[i] > best_rank:
+                    break
+                ray = hou.Vector3(P[i]) * inv - o_l
+                h = hou.Vector3()
+                hidden = geo.intersect(o_l, ray.normalized(), h, hou.Vector3(), hou.Vector3()) >= 0 and \
+                    (h - o_l).length() < ray.length() * (1 - 1e-5) - 1e-6
+                rank = dist[i] + (3.0 if hidden else 0.0)
+                if rank <= best_rank:
+                    best, best_rank = P[i], rank
+            if best is not None:
+                return tuple(best)
         if prim_num < 0:
             return None
-        mode = self.node.parm("snap").evalAsString()
-        prim = geo.prim(prim_num)
-        pts = [v.point().position() for v in prim.vertices()]
-        if mode == "points" and pts:
-            world = [p * xf for p in pts]
-            scr = np.array([tuple(self.vp.mapToScreen(p)) for p in world])
-            return tuple(world[int(np.argmin(np.linalg.norm(scr - mouse_px, axis=1)))])
-        if mode == "edges" and len(pts) > 1:
-            best, best_d = pos, float("inf")
-            closed = prim.type() == hou.primType.Polygon and prim.isClosed()
+        if mode == "edges":
+            prim = geo.prim(prim_num)
+            pts = [v.point().position() for v in prim.vertices()]
+            closed = isinstance(prim, hou.Face) and prim.isClosed()
+            best = None
             for a, b in zip(pts, pts[1:] + (pts[:1] if closed else [])):
                 ab = b - a
                 t = min(max((pos - a).dot(ab) / max(ab.dot(ab), 1e-30), 0.0), 1.0)
                 c = a + ab * t
-                if (c - pos).length() < best_d:
-                    best, best_d = c, (c - pos).length()
-            pos = best
+                if best is None or (c - pos).length() < (best - pos).length():
+                    best = c
+            if best is not None:
+                cand = np.array(best * xf)
+                if dist_px(cand[None])[0] <= SNAP_PX:
+                    return tuple(cand)
         return tuple(pos * xf)
 
     # ---------------------------------------------------------------- pins editing
@@ -304,6 +355,8 @@ class State(object):
         ev = kwargs["ui_event"]
         dev = ev.device()
         reason = ev.reason()
+        if hasattr(ev, "curViewport") and ev.curViewport() != self.vp:
+            return False                                   # another viewport of a split layout
         self._watchdog()
         fr = self._frame()
         if fr is None:
@@ -333,7 +386,7 @@ class State(object):
         if reason in (R.Start, R.Picked) and dev.isLeftButton():
             data = self.pm.load_pins(self.node)
             if self._create_modifier(dev):
-                anchor = self._hit_mesh(ev, px)
+                anchor = self._hit_mesh(uv, fr, px)
                 if anchor is None:
                     self.sv.setPromptMessage("Camera Pin Matcher: click on the reference mesh to create a pin",
                                              hou.promptMessageType.Warning)
@@ -509,14 +562,14 @@ class State(object):
         self.d_plate = None           # created per plate resolution, see _plate()
         self.d_wire = GD(sv, T.Line, "cpm_wire")
         self.d_face = GD(sv, T.Face, "cpm_face")
-        self.d_targets = GD(sv, T.Point, "cpm_targets")
+        # marker styles like Locate/Ring ignore Cd, so there is one target drawable per pin state
+        self.d_targets = {k: GD(sv, T.Point, "cpm_targets_" + k) for k in COLORS}
         self.d_selected = GD(sv, T.Point, "cpm_selected")
         self.d_anchors = GD(sv, T.Point, "cpm_anchors")
         self.d_lines = GD(sv, T.Line, "cpm_lines")
-        self.d_ghosts = GD(sv, T.Point, "cpm_ghosts")
         self.d_text = hou.TextDrawable(sv, "cpm_text")
-        self.drawables = [self.d_wire, self.d_face, self.d_targets, self.d_selected,
-                          self.d_anchors, self.d_lines, self.d_ghosts, self.d_text]
+        self.drawables = [self.d_wire, self.d_face, self.d_selected, self.d_anchors, self.d_lines, self.d_text] + \
+            list(self.d_targets.values())
         for d in self.drawables:
             d.setVisibleInViewport(self.vp)
             d.show(True)
@@ -605,6 +658,7 @@ class State(object):
         fr = self._frame()
         if fr is None:
             return
+        self._measure_frame(fr)
         fg = n.parm("platemode").evalAsString() == "fg"
         opacity = n.parm("opacity").eval()
 
@@ -630,17 +684,30 @@ class State(object):
         self._draw_pins(handle, fr)
         self._update_hud()
 
-    def _points_geo(self, P, colors):
+    def _points_geo(self, P, colors=None):
         g = hou.Geometry()
         g.addAttrib(hou.attribType.Point, "Cd", (1.0, 1.0, 1.0))
         if len(P):
             g.createPoints([tuple(map(float, p)) for p in P])
-            g.setPointFloatAttribValues("Cd", [float(c) for col in colors for c in col])
+            if colors is not None:
+                g.setPointFloatAttribValues("Cd", [float(c) for col in colors for c in col])
         return g
 
+    def _markers(self, drawable, P, color, style, radius, alpha=1.0):
+        if len(P):
+            drawable.setGeometry(self._points_geo(P))
+            drawable.draw(self._handle, {"style": style, "radius": radius, "color1": tuple(color) + (alpha,),
+                                         "use_cd": False, "fade_factor": 1.0, "glow_width": 3,
+                                         "highlight_mode": hou.drawableHighlightMode.MatteOverGlow,
+                                         "color2": (0.0, 0.0, 0.0, 0.85 * alpha)})
+
     def _draw_pins(self, handle, fr):
+        """Target marker (state colour) + reprojected anchor dot + residual line + id/error label per
+        pin; ghost targets of the previous/next pinned frame."""
         n, pm = self.node, self.pm
         rig, W, f, depth = fr.rig, fr.W, fr.f, fr.near
+        self._handle = handle
+        S = hou.drawableGeometryPointStyle
         data = self._pins()
         pins = pm.pins_at(data)
         show_err = n.parm("showerrors").eval()
@@ -650,53 +717,45 @@ class State(object):
             uv_a, z = rig.project(W, f, np.array([p["p"] for p in pins]))
             front = z > 0
             err = rig.pixel_errors(uv_a, uv_t)
-            cols = [COLORS["selected"] if p["id"] == self.selected else COLORS["inactive"] if not p["on"]
-                    else COLORS["locked"] if p["lock"] else COLORS["active"] for p in pins]
+            state = ["inactive" if not p["on"] else "locked" if p["lock"] else "active" for p in pins]
             T = rig.unproject(W, f, uv_t, depth)
             A = rig.unproject(W, f, uv_a[front], depth)
-            self.d_targets.setGeometry(self._points_geo(T, cols))
-            self.d_targets.draw(handle, {"style": hou.drawableGeometryPointStyle.RingsCircle, "radius": 7,
-                                         "num_rings": 2, "falloff_range": hou.Vector2(0, 1), "fade_factor": 1.0})
-            sel = [i for i, p in enumerate(pins) if p["id"] == self.selected]
-            if sel:
-                self.d_selected.setGeometry(self._points_geo(T[sel], [COLORS["selected"]]))
-                self.d_selected.draw(handle, {"style": hou.drawableGeometryPointStyle.RingsCircle, "radius": 12,
-                                              "num_rings": 1, "falloff_range": hou.Vector2(0, 1), "fade_factor": 1.0})
-            self.d_anchors.setGeometry(self._points_geo(A, [c for c, fr in zip(cols, front) if fr]))
-            self.d_anchors.draw(handle, {"style": hou.drawableGeometryPointStyle.SmoothSquare, "radius": 3,
-                                         "fade_factor": 1.0})
+            for key in ("inactive", "locked", "active"):
+                self._markers(self.d_targets[key], T[[s_ == key for s_ in state]], COLORS[key], S.Locate, 15)
+            sel = [p["id"] == self.selected for p in pins]
+            self._markers(self.d_selected, T[sel], COLORS["selected"], S.Ring, 24)
+            cols = [COLORS[s_] for s_, fr_ in zip(state, front) if fr_]
+            self.d_anchors.setGeometry(self._points_geo(A, cols))
+            self.d_anchors.draw(handle, {"style": S.SmoothCircle, "radius": 6, "fade_factor": 1.0, "glow_width": 2,
+                                         "highlight_mode": hou.drawableHighlightMode.MatteOverGlow,
+                                         "color2": (0.0, 0.0, 0.0, 0.85)})
             lg = hou.Geometry()
             lg.addAttrib(hou.attribType.Point, "Cd", (1.0, 1.0, 1.0))
-            for (t, a, c) in zip(T[front], A, [c for c, fr in zip(cols, front) if fr]):
+            for t, a, c in zip(T[front], A, cols):
                 poly = lg.createPolygon(is_closed=False)
-                for p in (t, a):
+                for q in (t, a):
                     pt = lg.createPoint()
-                    pt.setPosition(_vec(p))
+                    pt.setPosition(_vec(q))
                     pt.setAttribValue("Cd", c)
                     poly.addVertex(pt)
             self.d_lines.setGeometry(lg)
-            self.d_lines.draw(handle, {"line_width": 1.5, "fade_factor": 1.0})
-            scr = self._screen(fr, uv_t)
-            for p, s, e, c, fr in zip(pins, scr, err, cols, front):
-                label = str(p["id"]) + (("  %.2fpx" % e) if show_err and fr else "") + ("" if fr else "  (behind)")
-                text.append((label, s, c))
+            self.d_lines.draw(handle, {"line_width": 2.0, "fade_factor": 1.0})
+            for p, sc, e, st, fr_ in zip(pins, self._screen(fr, uv_t), err, state, front):
+                label = str(p["id"]) + (("  %.2f px" % e) if show_err and fr_ else "") + ("" if fr_ else "  (behind camera)")
+                text.append((label, sc, COLORS["selected"] if p["id"] == self.selected else COLORS[st]))
         if n.parm("showghosts").eval():
-            gp, gc = [], []
-            for fr in pm.neighbour_frames(data):
-                if fr is not None:
-                    for p in pm.pins_at(data, fr):
-                        gp.append(p["uv"])
-                        gc.append(p["id"])
+            gp, gid = [], []
+            for fr_ in pm.neighbour_frames(data):
+                for p in pm.pins_at(data, fr_) if fr_ is not None else []:
+                    gp.append(p["uv"])
+                    gid.append("%d'  (f%d)" % (p["id"], fr_))
             if gp:
-                T = rig.unproject(W, f, gp, depth)
-                self.d_ghosts.setGeometry(self._points_geo(T, [COLORS["ghost"]] * len(T)))
-                self.d_ghosts.draw(handle, {"style": hou.drawableGeometryPointStyle.RingsCircle, "radius": 5,
-                                            "num_rings": 1, "falloff_range": hou.Vector2(0, 1), "fade_factor": 1.0})
-                for pid, s in zip(gc, self._screen(fr, gp)):
-                    text.append(("%d'" % pid, s, COLORS["ghost"]))
-        for label, s, c in text:
-            self.d_text.draw(handle, {"text": label, "translate": hou.Vector3(s[0] + 9, s[1] + 6, 0),
-                                      "color1": hou.Vector4(c[0], c[1], c[2], 1.0)})
+                self._markers(self.d_targets["ghost"], rig.unproject(W, f, gp, depth), COLORS["ghost"], S.Locate, 11, 0.7)
+                text += [(label, sc, COLORS["ghost"]) for label, sc in zip(gid, self._screen(fr, gp))]
+        for label, sc, c in text:
+            self.d_text.draw(handle, {"text": label, "translate": hou.Vector3(sc[0] + 12, sc[1] + 10, 0),
+                                      "color1": (c[0], c[1], c[2], 1.0), "glow_width": 2, "color2": (0.0, 0.0, 0.0, 1.0),
+                                      "highlight_mode": hou.drawableHighlightMode.MatteOverGlow})
 
 
 def _menu(state_name, definitions):
