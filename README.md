@@ -281,26 +281,29 @@ Houdini's viewer-state dispatch. See `TESTLOG.md` for the results.
 
 ## Known limitations
 
-The GitHub issues track open work and ideas; the numbers below refer to them.
+The [GitHub issues](https://github.com/robinbenito/houdini-camera-tracker/issues) track open
+work and ideas; the numbers below refer to them.
 
 * **Not tested with real mouse and keyboard input** (#1). Real input goes through Houdini's own
   dispatch, which the GUI test can't reach. In particular, whether Space + drag (the volatile
   view tool) is fully consumed or briefly tumbles before the watchdog snaps the view back
   depends on that dispatch (#3).
 * On macOS, Houdini's **Ctrl** is expected to be **⌘**. If Ctrl + click doesn't create pins,
-  switch **Create Pin Modifier** to Shift.
+  switch **Create Pin Modifier** to Shift (#1).
 * Pins are anchored to world positions fixed when they are created. Deforming or animated
-  reference meshes are displayed at the current frame, but existing anchors don't follow them.
+  reference meshes are displayed at the current frame, but existing anchors don't follow
+  them (#9).
 * The solve uses only the pins of the current frame. There is no bundle adjustment across
-  frames and no lens distortion.
+  frames (#6) and no lens distortion (#5). One bad pin pulls the whole solve (#7).
 * **Lock Roll** is a stiff constraint on the camera's roll relative to world +Y. It holds to
   about 1e-8 rad but is not an exact elimination. It isn't defined for cameras looking straight
-  up or down.
+  up or down (#8).
 * The plate is loaded into memory per frame (about 60 ms for 1280×720), so scrubbing through
-  4K plates is slow.
-* The view proxy appears in the viewport's camera menu.
-* The files in this repository are Indie-licensed. Rebuild them with the commands above for
-  other license types.
+  4K plates is slow, and there is no OCIO view transform (#11).
+* The view proxy appears in the viewport's camera menu (#4).
+* Solving is disabled for cameras with look-at or constraints and for orthographic cameras (#15).
+* Only tested on macOS with an Indie license. The files in this repository are Indie-licensed;
+  rebuild them with the commands above for other license types (#16).
 
 ## Houdini 22 API notes
 

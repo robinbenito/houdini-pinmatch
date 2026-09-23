@@ -117,7 +117,7 @@ Other checks in the GUI test, all PASS (38 in total):
 
 ## Known gaps
 
-* **Real OS mouse and keyboard input wasn't exercised.** Synthetic Qt events don't reach
+* **Real OS mouse and keyboard input wasn't exercised** (issues #1 and #3). Synthetic Qt events don't reach
   Houdini's viewer-state dispatch, and a computer-use check was declined. The GUI test calls the
   live state's handlers directly, with rays from the real viewport. Its mock events mimic HOM
   where that matters: `curViewport()` returns a fresh wrapper, and mouse coordinates are in

@@ -285,11 +285,42 @@ What I learned about testing a viewer state:
 
 ## Open work
 
-See the GitHub issues. The most important ones:
+All open work is tracked in the
+[GitHub issues](https://github.com/robinbenito/houdini-camera-tracker/issues). Start at the top:
 
-* #1: verify with real mouse and keyboard input
-* #2: test scene portability
-* #3: Space and Alt navigation lock under real input
+**Verification first**
+* #1 Verify the tool with real mouse and keyboard input (**priority: high**)
+* #2 Test scene only finds the asset on the machine it was saved on (bug; also scrub machine
+  paths before going public)
+* #3 Navigation lock under real input: Space, Alt, view hotkeys
+* #16 Cross-platform and license coverage (Windows, Linux, FX/Core builds)
+* #17 Run the test suites in CI
 
-Everything else is enhancements, grouped by the labels `solver`, `viewer-state`, `performance`
-and `testing`.
+**Solver**
+* #5 Lens distortion
+* #6 Sequence solve: consistent focal, smoother keys
+* #7 Robust loss and bad-pin flagging
+* #8 Exact roll lock
+* #15 Look-at, constraints, rigs, orthographic cameras
+
+**Viewer state and UX**
+* #4 Native tumble lock instead of the view proxy (needs HOM from SideFX)
+* #12 Hover feedback, snap preview, keyboard nudging
+* #13 HUD/menu show the user's real hotkeys (good first issue)
+* #14 Keyed and pinned frames on the timeline
+* #18 Depth-correct shaded mesh, hidden-line wireframe
+* #20 Pin management panel
+
+**Data and tracking**
+* #9 Pins that follow animated or deforming geometry
+* #10 Assisted 2D tracking for copied pins
+
+**Performance**
+* #11 Plate caching, prefetch, proxy resolution, OCIO
+* #19 Per-redraw HUD solve and mesh rebuilds
+
+**Docs**
+* #21 Demo video and tutorial (after #1)
+
+When you close an issue, update the matching README limitation, the TESTLOG entries and, for
+Houdini discoveries, the gotcha list above.
