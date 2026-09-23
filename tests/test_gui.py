@@ -22,7 +22,7 @@ import numpy as np
 import hdefereval
 import hou
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(sys._getframe().f_code.co_filename)))  # no __file__ in houdini <script>
 EXT = {hou.licenseCategoryType.Commercial: "", hou.licenseCategoryType.Indie: "lc"}.get(hou.licenseCategory(), "nc")
 SCENE = os.path.join(ROOT, "scenes", "pinmatch_test.hip" + EXT)
 LOG = os.path.join(ROOT, "tests", "gui_test_log.txt")
@@ -109,8 +109,10 @@ def live_state(node):
             pass
 
 
-def refresh():
+def refresh(st=None):
     from PySide6 import QtWidgets
+    if st is not None:
+        st._sync_view()          # the viewport picks up script-driven camera/time changes asynchronously
     hou.ui.paneTabOfType(hou.paneTabType.SceneViewer).curViewport().draw()
     QtWidgets.QApplication.processEvents()
 
@@ -224,12 +226,16 @@ def run():
     #     one gesture, as a user would). Pin 1 must stay put while pin 2 is dragged.
     n_undo = len(hou.undos.undoLabels())
     worst_pin1, snap_err, steps, used = 0.0, 0.0, 12, []
+    noise = np.random.default_rng(5).normal(0.0, 0.5, (6, 2))    # user placement accuracy, px
+    jitter = np.array([3.0, -2.0])                              # click a bit off the corner: snapping
+    log("| pins | status | position error | rotation error | focal error | RMS |")
+    log("|---|---|---|---|---|---|")
     for i in range(6):
         p, target = next_corner(pm, room, cam, gt, used)
         used.append(target)
         fr = st._frame()
-        a = st._screen(fr, fr.rig.project(fr.W, fr.f, p[None])[0])[0] + np.array([3.0, -2.0])  # a bit off: snap
-        b = st._screen(fr, [target])[0]
+        a = st._screen(fr, fr.rig.project(fr.W, fr.f, p[None])[0])[0] + jitter
+        b = st._screen(fr, [target])[0] + jitter + noise[i] * np.array([1, -1])   # grab offset kept
         drv._send(a[0], a[1], R.Start, left=True, ctrl=True)
         for k in range(1, steps + 1):
             t = k / float(steps)
@@ -242,6 +248,10 @@ def run():
         drv._send(b[0], b[1], R.Changed)
         refresh()
         snap_err = max(snap_err, np.linalg.norm(np.array(pm.pins_at(pm.load_pins(node))[-1]["p"]) - p))
+        if i >= 2:
+            dpos, drot, dfoc = cam_error(pm, cam, gt)
+            h = st._hud_values()
+            log("| %d | %s | %.4f | %.3f deg | %.3f %% | %s |" % (i + 1, h["status"], dpos, drot, dfoc, h["rms"]))
     pins = pm.pins_at(pm.load_pins(node))
     ids = [p["id"] for p in pins]
     check(len(pins) == 6 and snap_err < 1e-4, "6 pins created by Ctrl+drag, point snapping exact (max error %.1e)" % snap_err)
@@ -357,7 +367,7 @@ def run():
     hou.setFrame(1)
     for mode in ("bg", "fg"):
         node.parm("platemode").set(mode)
-        refresh()
+        refresh(st)
         img = os.path.join(ROOT, "tests", "gui_%s.png" % mode)
         hou.qt.mainWindow().grab().save(img)
         log("saved screenshot", os.path.relpath(img, ROOT))

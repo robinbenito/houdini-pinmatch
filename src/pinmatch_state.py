@@ -5,6 +5,7 @@ the target camera exactly and carries the 2D pan/zoom in its own screen window),
 the reference mesh and the pins with drawables, and turns pin edits into live camera solves.
 Math, storage and camera IO live in the asset's PythonModule (node.hdaModule()).
 """
+import json
 import os
 import types
 
@@ -83,21 +84,27 @@ class State(object):
         self._attach()
         self._vp_callback = self._on_viewport_event
         self.vp.addEventCallback(self._vp_callback)
-        self.sv.hudInfo(template=HUD)
+        hud = json.loads(json.dumps(HUD))
+        hud["rows"][8]["key"] = {"ctrl": "Ctrl", "shift": "Shift", "ctrlshift": "Ctrl + Shift"}[
+            self.node.parm("createmod").evalAsString()] + " + LMB"
+        self.sv.hudInfo(template=hud)
         cam = self.pm.target_camera(self.node)
         self.pm.match_resolution(self.node, cam)
         self._warn_camera(cam)
         self._update_hud(force=True)
 
     def onExit(self, kwargs):
-        self._end_drag(commit=True)
+        try:
+            self._end_drag(commit=True)
+            self._set_view(0.5, 0.5, 1.0)
+        except hou.ObjectWasDeleted:                    # the matcher node was deleted
+            pass
         try:
             self.vp.removeEventCallback(self._vp_callback)
         except (hou.Error, AttributeError):
             pass
         s = self.saved or {}
         self.vp.settings().setVisibleObjects(s.get("mask", "*"))
-        self._set_view(0.5, 0.5, 1.0)
         if s.get("camera") is not None:
             self.vp.setCamera(s["camera"])
         else:
@@ -130,6 +137,13 @@ class State(object):
         if self.vp.isCameraLockedToView():
             self.vp.lockCameraToView(False)
 
+    def _sync_view(self):
+        """Push the (expression-driven) proxy into the view now. The viewport picks up camera
+        changes asynchronously, which would leave the drawables a redraw ahead of the view."""
+        proxy = self._proxy()
+        if proxy is not None and self.vp.camera() == proxy:
+            self.vp.setCamera(proxy)
+
     def _watchdog(self):
         if self.pm.target_camera(self.node) is not None and self.vp.camera() != self._proxy():
             self._attach()
@@ -147,6 +161,7 @@ class State(object):
         with hou.undos.disabler():
             for name, value in (("view_cx", cx), ("view_cy", cy), ("view_zoom", zoom)):
                 self.node.parm(name).set(value)
+        self._sync_view()
 
     def _zoom_at(self, uv, factor):
         cx, cy, z = self._view()
@@ -329,6 +344,7 @@ class State(object):
         if info["n"]:
             dr["q"] = q
             self.pm.write_camera(dr["cam"], q, dr["free"])
+            self._sync_view()
         return info
 
     def _end_drag(self, commit=True):
@@ -437,6 +453,14 @@ class State(object):
 
     def onPlaybackChangeEvent(self, kwargs):
         self._end_drag(commit=True)
+        self._sync_view()
+        data = self.pm.load_pins(self.node)
+        src = self.pm.nearest_pin_frame(data)
+        if not self.pm.pins_at(data) and src is not None:
+            self.sv.setPromptMessage("%s: no pins on frame %s - press C to copy the pins of frame %d"
+                                     % (LABEL, self.pm.frame_key(), src))
+        else:
+            self.sv.clearPromptMessage()
         self._update_hud(force=True)
 
     def onNodeChangeEvent(self, kwargs):
@@ -470,6 +494,7 @@ class State(object):
             self._delete_selected()
         elif item == "solve_key":
             info = pm.solve_and_key(n)
+            self._sync_view()
             self.sv.setPromptMessage("Camera Pin Matcher: %s, RMS %.2f px" % (info["status"], info.get("rms", 0)))
         elif item == "copy_nearest":
             src = pm.copy_nearest_pins(n)
@@ -480,6 +505,7 @@ class State(object):
             if cam is not None:
                 with hou.undos.group(pm.UNDO_PREFIX + "Delete keys on frame"):
                     pm.delete_keys(cam)
+                self._sync_view()
         elif item == "keyed_frames":
             pm.cb_keyed_frames({"node": n})
         elif item == "reset_view":
@@ -505,15 +531,17 @@ class State(object):
 
     # ---------------------------------------------------------------- warnings + HUD
     def _warn_camera(self, cam):
+        """Say (once per problem set) which camera parms are never written, or why solving is off.
+        Non-modal: viewport flash + status bar; the HUD keeps showing it."""
         fatal, protected = self.pm.camera_problems(cam)
         key = (cam.path() if cam else None, fatal, tuple(sorted(protected.items())))
         if (fatal is None and not protected) or key in self.caches.setdefault("warned", set()):
             return
         self.caches["warned"].add(key)
-        lines = (["Solving is disabled: %s." % fatal] if fatal else []) + \
-                ["%s: %s - treated as locked, never overwritten." % (k, v) for k, v in sorted(protected.items())]
-        hou.ui.displayMessage("Camera %s\n\n%s" % (cam.path() if cam else "(none)", "\n".join(lines)),
-                              severity=hou.severityType.Warning, title=LABEL)
+        msg = ("solving is disabled: %s" % fatal) if fatal else "%s: %s never overwritten (%s)" % (
+            cam.name(), ", ".join(sorted(protected)), ", ".join(sorted(set(protected.values()))))
+        self.sv.flashMessage("", LABEL + ": " + msg, 8.0, self.vp)
+        hou.ui.setStatusMessage(LABEL + ": " + msg, hou.severityType.Warning)
 
     def _update_hud(self, force=False):
         vals = self._hud_values()
@@ -530,7 +558,9 @@ class State(object):
         frame = int(pm.frame_key())
         keys = pm.keyed_frames(cam)
         locks = [p for p in pm.PARMS + ("roll",) if n.parm("lock_" + p).eval()]
-        vals = {"pins": "%d / %d" % (len(act), len(pins)), "frame": "%d%s" % (frame, "  (keyed)" if frame in keys else ""),
+        src = pm.nearest_pin_frame(data) if not pins else None
+        vals = {"pins": "%d / %d" % (len(act), len(pins)) + ("   (C: copy from frame %d)" % src if src is not None else ""),
+                "frame": "%d%s" % (frame, "  (keyed)" if frame in keys else ""),
                 "keys": (", ".join(map(str, keys[:10])) + (" ..." if len(keys) > 10 else "")) or "none",
                 "status": "-", "rms": "-", "lens": "-", "locks": ", ".join(locks) or "none"}
         if cam is None:
@@ -553,6 +583,9 @@ class State(object):
             vals["status"] = "no active pins"
         if pm.reference_object(n) is None:
             vals["status"] += "  |  set Reference Geometry"
+        path = pm.plate_path(n)
+        if not path or not os.path.isfile(path):
+            vals["frame"] += "  (no plate)" if not path else "  (plate missing)"
         return vals
 
     # ---------------------------------------------------------------- drawing
@@ -658,6 +691,10 @@ class State(object):
         fr = self._frame()
         if fr is None:
             return
+        view = self.pm._m(self.vp.viewTransform())
+        if np.abs(view[:3, :3] - fr.W[:3, :3]).max() > 1e-6 or np.abs(view[3, :3] - fr.W[3, :3]).max() > 1e-6 * (
+                1.0 + np.abs(fr.W[3, :3]).max()):
+            hdefereval.executeDeferred(self._sync_view)      # view lags the camera (undo, script, time change)
         self._measure_frame(fr)
         fg = n.parm("platemode").evalAsString() == "fg"
         opacity = n.parm("opacity").eval()
@@ -752,10 +789,11 @@ class State(object):
             if gp:
                 self._markers(self.d_targets["ghost"], rig.unproject(W, f, gp, depth), COLORS["ghost"], S.Locate, 11, 0.7)
                 text += [(label, sc, COLORS["ghost"]) for label, sc in zip(gid, self._screen(fr, gp))]
-        for label, sc, c in text:
+        for label, sc, c in text:     # hou.Color renders crisp text (tuples come out dim); glow blurs it
             self.d_text.draw(handle, {"text": label, "translate": hou.Vector3(sc[0] + 12, sc[1] + 10, 0),
-                                      "color1": (c[0], c[1], c[2], 1.0), "glow_width": 2, "color2": (0.0, 0.0, 0.0, 1.0),
-                                      "highlight_mode": hou.drawableHighlightMode.MatteOverGlow})
+                                      "color1": hou.Color(*(0.35 * v + 0.65 for v in c)),
+                                      "scale": hou.Vector3(1.25, 1.25, 1.25), "glow_width": 0,
+                                      "highlight_mode": hou.drawableHighlightMode.Matte})
 
 
 def _menu(state_name, definitions):

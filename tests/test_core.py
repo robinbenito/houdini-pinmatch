@@ -178,6 +178,64 @@ def test_cheirality():
     assert (z > 0).all() and 5.0 - 1e-9 <= q[6] <= 500.0 + 1e-9 and np.all(np.isfinite(q))
 
 
+def test_protected_parms():
+    cam = make_cam("pp", t=(0.0, 1.0, 5.0), focal=35.0, res=(1280, 720))
+    cam.parm("tx").setExpression("sin($F) * 0.1")                 # expression -> protected
+    cam.parm("ry").lock(True)                                     # padlock -> protected
+    for f, v in ((1, 5.0), (10, 4.0)):                            # plain animation is fine
+        cam.parm("tz").setKeyframe(hou.Keyframe(v, hou.frameToTime(f)))
+    fatal, prot = pm.camera_problems(cam)
+    assert fatal is None and prot == {"tx": "expression/reference", "ry": "locked"}, prot
+    before = [cam.parm(n).eval() for n in pm.PARMS]
+    free = [n not in prot for n in pm.PARMS]
+    with hou.undos.disabler():
+        pm.write_camera(cam, np.array(before) + 1.0, free)
+    after = [cam.parm(n).eval() for n in pm.PARMS]
+    assert after[0] == before[0] and after[4] == before[4] and after[1] == before[1] + 1.0
+    cam.parm("lookatpath").set("/obj")
+    assert pm.camera_problems(cam)[0] == "camera uses Look At"
+    print("protected parms: %s treated as locked, look-at disables solving" % sorted(prot))
+
+
+def test_hda():
+    """Asset-level behaviour in a fresh scene: callbacks, resolution matching, undo grouping."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ext = {hou.licenseCategoryType.Commercial: "", hou.licenseCategoryType.Indie: "lc"}.get(hou.licenseCategory(), "nc")
+    hou.hda.installFile(os.path.join(root, "otls", "camera_pin_matcher.hda" + ext))
+    cam = make_cam("hcam", t=(0.4, 1.5, 3.0), r=(-5.0, 10.0, 0.0), focal=35.0, res=(640, 480))
+    node = hou.node("/obj").createNode("pinmatch::camera_pin_matcher::1.0")
+    node.parm("camera").set(cam.path())
+    node.parm("plate").set(os.path.join(root, "scenes", "plate", "plate.$F4.jpg"))
+    npm = node.hdaModule()
+    node.parm("matchres").set(1)
+    assert npm.match_resolution(node, cam) and cam.parmTuple("res").eval() == (1280, 720)
+    rig = npm.Rig(cam)
+    W = rig.world(rig.q)
+    P = scene_points(6) @ W[:3, :3] + W[3, :3]
+    uv, _ = rig.project(W, rig.q[6], P)
+    data = npm.load_pins(node)
+    for p, t in zip(P, uv + 0.01):                          # pins that ask for a small camera move
+        npm.new_pin(data, 1, p, t)
+    npm.save_pins(node, data)
+    hou.setFrame(1)
+    n_undo = len(hou.undos.undoLabels())
+    node.parm("solvekey").pressButton()
+    assert len(hou.undos.undoLabels()) == n_undo + 1, hou.undos.undoLabels()[:3]
+    assert npm.keyed_frames(cam) == [1] and abs(cam.parm("focal").eval() - 35.0) > 1e-6
+    hou.undos.performUndo()
+    assert npm.keyed_frames(cam) == [] and cam.parm("focal").eval() == 35.0
+    node.parm("preset_nodal").pressButton()
+    assert [node.parm("lock_" + n).eval() for n in ("tx", "ty", "tz", "rx")] == [1, 1, 1, 0]
+    hou.setFrame(5)
+    node.parm("copynearest").pressButton()
+    assert [p["id"] for p in npm.pins_at(npm.load_pins(node), 5)] == [1, 2, 3, 4, 5, 6]
+    node.parm("deactivateall").pressButton()
+    assert not any(p["on"] for f in npm.load_pins(node)["frames"].values() for p in f)
+    node.parm("deleteframe").pressButton()
+    assert npm.pin_frames(npm.load_pins(node)) == [1]
+    print("hda: resolution matched, Solve & Key = 1 undo step, presets / copy / deactivate / delete buttons ok")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and (len(sys.argv) < 2 or name in sys.argv[1:]):
