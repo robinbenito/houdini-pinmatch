@@ -55,9 +55,9 @@ focal as `log f`, clamped to `[fmin, fmax]`):
 1. **Data**: for each active pin `(uᵢ(q) − uᵢ*)·resx`, `(vᵢ(q) − vᵢ*)·resy` → pixels.
 2. **Minimal change prior** toward the anchor camera `a` (camera at drag start), expressed in
    *pixel-equivalents* so every term is comparable to the data term:
-   `λ·[F·ω_tilt, F·ω_pan, 3R·ω_roll, 3R·log(f/fa), 30F·δx/D, 30F·δy/D, 30R·δz/D]`
+   `λ·[F·ω_tilt, F·ω_pan, 8R·ω_roll, 8R·log(f/fa), 120F·δx/D, 120F·δy/D, 40R·δz/D]`
    with `ω = log(Raᵀ R)` (camera frame), `δ = Raᵀ(c − ca)`, `F` focal in px, `R` half image
-   diagonal in px, `D` median pin depth. Stiffness order pan/tilt < roll ≈ zoom < translation gives:
+   diagonal in px, `D` median pin depth, `λ = 2e-4`. Stiffness order pan/tilt < roll ≈ zoom < dolly < truck/pedestal gives:
    1 pin → pan/tilt; 2 pins → + roll + zoom (dolly if focal locked); 3+ → translation as needed.
    `λ` is small (fit dominates whenever the pins determine the camera).
 3. **Lock roll** (geometric, independent of rotate order): stiff residual on
