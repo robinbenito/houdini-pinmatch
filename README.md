@@ -28,8 +28,10 @@ build_hda.py                    rebuilds the asset from src/ (hython build_hda.p
 scenes/pinmatch_test.hiplc      test scene: room mesh, ground-truth camera, camera to solve
 scenes/plate/plate.####.jpg     24-frame plate rendered (Karma) from the ground-truth camera
 tests/                          headless tests, GUI integration test, scene generator
+dev/                            remote-control harness for a GUI Houdini (development only)
 TESTLOG.md                      test results (ground truth comparison)
-PLAN.md                         technical plan and Houdini 22 API notes
+PLAN.md                         technical plan (solver formulation, design decisions)
+DEVELOPMENT.md                  developer handoff: architecture, build/test loop, Houdini 22 gotchas
 ```
 
 ## Installation
@@ -38,10 +40,21 @@ Requirements: Houdini 22.0 (developed and tested on 22.0.368, macOS). You don't 
 Python packages: `numpy` ships with Houdini. The tool uses no environment variables and no
 hard-coded paths.
 
-1. In Houdini, go to **Assets > Install Asset Library...** and pick `otls/camera_pin_matcher.hdalc`.
-   You can also copy the file into `$HOUDINI_USER_PREF_DIR/otls/`, or open
-   `scenes/pinmatch_test.hiplc`, which loads the asset from `../otls` by itself.
-2. The node is **Camera Pin Matcher** in the OBJ Tab menu.
+Install the asset in one of these ways:
+
+* In Houdini, go to **Assets > Install Asset Library...** and pick
+  `otls/camera_pin_matcher.hdalc`.
+* Copy the file into `$HOUDINI_USER_PREF_DIR/otls/`.
+* Make the repo a Houdini package: save
+  `{"hpath": "/path/to/houdini-camera-tracker"}` as
+  `$HOUDINI_USER_PREF_DIR/packages/camera_pin_matcher.json`. Houdini then scans the repo's
+  `otls/` in every session.
+
+The node is **Camera Pin Matcher** in the OBJ Tab menu.
+
+Install the asset before you open `scenes/pinmatch_test.hiplc` on another machine or from
+another checkout location. The .hip records the asset path of the machine it was saved on
+(issue #2).
 
 **License note:** the committed files were built with Houdini **Indie**, so they are Limited
 Commercial files (`.hdalc`, `.hiplc`). The sources are license-neutral. To build files for your
@@ -253,6 +266,7 @@ houdini -foreground tests/test_gui.py
 ```
 
 Opens a GUI session, runs the tool on the test scene, writes `tests/gui_test_log.txt` and exits.
+To run it in a session that is already open, see the `dev/` harness in DEVELOPMENT.md.
 
 ```bash
 hython tests/make_test_scene.py
@@ -267,10 +281,12 @@ Houdini's viewer-state dispatch. See `TESTLOG.md` for the results.
 
 ## Known limitations
 
-* **Not tested with real mouse and keyboard input.** Real input goes through Houdini's own
+The GitHub issues track open work and ideas; the numbers below refer to them.
+
+* **Not tested with real mouse and keyboard input** (#1). Real input goes through Houdini's own
   dispatch, which the GUI test can't reach. In particular, whether Space + drag (the volatile
   view tool) is fully consumed or briefly tumbles before the watchdog snaps the view back
-  depends on that dispatch.
+  depends on that dispatch (#3).
 * On macOS, Houdini's **Ctrl** is expected to be **⌘**. If Ctrl + click doesn't create pins,
   switch **Create Pin Modifier** to Shift.
 * Pins are anchored to world positions fixed when they are created. Deforming or animated

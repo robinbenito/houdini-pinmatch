@@ -1,10 +1,11 @@
 """GUI integration test for the Camera Pin Matcher viewer state.
 
 Runs inside a graphical Houdini session:   houdini -foreground tests/test_gui.py
-(or exec it in an open session). It loads the test scene, enters the tool, and drives the live
-state's event handlers with mock UI events whose rays come from the real viewport
-(GeometryViewport.mapToWorld), so everything below the raw OS input layer is exercised:
-picking, snapping, live solves, drawables, parm writes, keys, undo.
+(or, in a session started with dev/start_rpc.py:   hython dev/rpc.py tests/test_gui.py).
+It loads the test scene, enters the tool, and drives the live state's event handlers with mock
+UI events whose rays come from the real viewport (GeometryViewport.mapToWorld), so everything
+below the raw OS input layer is exercised: picking, snapping, live solves, drawables, parm
+writes, keys, undo.
 Results go to tests/gui_test_log.txt; Houdini exits when launched from the command line.
 """
 import gc
@@ -25,6 +26,7 @@ import hou
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(sys._getframe().f_code.co_filename)))  # no __file__ in houdini <script>
 EXT = {hou.licenseCategoryType.Commercial: "", hou.licenseCategoryType.Indie: "lc"}.get(hou.licenseCategory(), "nc")
 SCENE = os.path.join(ROOT, "scenes", "pinmatch_test.hip" + EXT)
+HDA = os.path.join(ROOT, "otls", "camera_pin_matcher.hda" + EXT)
 LOG = os.path.join(ROOT, "tests", "gui_test_log.txt")
 R = hou.uiEventReason
 lines = []
@@ -188,6 +190,7 @@ def next_corner(pm, room, cam, gt, used_uv):
 # ------------------------------------------------------------------ the test
 def run():
     t0 = time.time()
+    hou.hda.installFile(HDA)       # the scene records the library by absolute/$JOB path: not portable
     hou.hipFile.load(SCENE, suppress_save_prompt=True, ignore_load_warnings=True)
     hou.setFrame(1)
     sv = hou.ui.paneTabOfType(hou.paneTabType.SceneViewer)
@@ -423,5 +426,7 @@ def main():
     return ok
 
 
-if __name__ in ("__main__", "__builtin__", "builtins") and hou.isUIAvailable() and "--no-exit" not in sys.argv:
+if __name__ == "__rpc__":                   # hython dev/rpc.py tests/test_gui.py (open dev session)
+    main()
+elif __name__ in ("__main__", "__builtin__", "builtins") and hou.isUIAvailable() and "--no-exit" not in sys.argv:
     hdefereval.executeDeferred(lambda: (main(), hou.exit(suppress_save_prompt=True)))

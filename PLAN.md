@@ -2,7 +2,8 @@
 
 Target: Houdini 22.0.368 (Python 3.13, numpy 2.3). Everything below marked ✅ was
 checked against the local H22 docs (`$HFS/houdini/help/hom.zip`) and/or a live
-hython / GUI session before writing code.
+hython / GUI session before writing code. For the current code map, dev loop and
+Houdini gotchas see [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Architecture
 
