@@ -7,6 +7,7 @@ Math, storage and camera IO live in the asset's PythonModule (node.hdaModule()).
 """
 import json
 import os
+import time
 import types
 
 import numpy as np
@@ -69,6 +70,8 @@ class State(object):
         self.saved = None         # viewport state to restore on exit
         self.hud_values = None
         self.caches = {}
+        self.last_press = (None, 0.0)   # (pixel, time) of the last LMB press, to drop a trailing 'Picked'
+
 
     # ---------------------------------------------------------------- lifecycle
     def onEnter(self, kwargs):
@@ -105,12 +108,18 @@ class State(object):
             pass
         s = self.saved or {}
         self.vp.settings().setVisibleObjects(s.get("mask", "*"))
-        if s.get("camera") is not None:
-            self.vp.setCamera(s["camera"])
-        else:
+        try:
+            prev = s.get("camera")
+            if prev is not None and prev == self._proxy():        # entered while already in the tool view
+                prev = self.pm.target_camera(self.node)
+            if prev is not None:
+                self.vp.setCamera(prev)
+            else:
+                self.vp.useDefaultCamera()
+                if s.get("view") is not None:
+                    self.vp.setDefaultCamera(s["view"])
+        except hou.ObjectWasDeleted:
             self.vp.useDefaultCamera()
-            if s.get("view") is not None:
-                self.vp.setDefaultCamera(s["view"])
         self.vp.lockCameraToView(bool(s.get("linked")))
 
     def onInterrupt(self, kwargs):
@@ -371,7 +380,7 @@ class State(object):
         ev = kwargs["ui_event"]
         dev = ev.device()
         reason = ev.reason()
-        if hasattr(ev, "curViewport") and ev.curViewport() != self.vp:
+        if ev.curViewport().name() != self.vp.name():     # HOM viewport wrappers never compare equal
             return False                                   # another viewport of a split layout
         self._watchdog()
         fr = self._frame()
@@ -400,6 +409,11 @@ class State(object):
             return True
 
         if reason in (R.Start, R.Picked) and dev.isLeftButton():
+            pos, when = self.last_press
+            if reason == R.Picked and pos is not None and time.time() - when < 0.5 and np.linalg.norm(px - pos) < 3:
+                return True                  # the click was already handled as press/release
+            if reason == R.Start:
+                self.last_press = (px, time.time())
             data = self.pm.load_pins(self.node)
             if self._create_modifier(dev):
                 anchor = self._hit_mesh(uv, fr, px)
@@ -661,7 +675,8 @@ class State(object):
         return g
 
     def _mesh(self):
-        """(object, world xform, display geometry, shaded copy) cached per cook/frame."""
+        """Reference object; its wire / shaded drawables are rebuilt when the display SOP recooks
+        or the frame changes."""
         obj = self.pm.reference_object(self.node)
         if obj is None:
             return None
@@ -682,7 +697,7 @@ class State(object):
                 getattr(shaded, "set%sFloatAttribValues" % cls)("Cd", cd.ravel().tolist())
             self.d_wire.setGeometry(geo)
             self.d_face.setGeometry(shaded)
-            c = self.caches["mesh"] = (key, geo, shaded)
+            self.caches["mesh"] = (key, geo, shaded)
         return obj
 
     def onDraw(self, kwargs):

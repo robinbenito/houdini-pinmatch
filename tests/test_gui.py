@@ -61,6 +61,9 @@ class Event(object):
     def device(self): return self.dev
     def reason(self): return self.r
 
+    def curViewport(self):                 # a fresh wrapper, like real HOM (wrappers never compare equal)
+        return hou.ui.paneTabOfType(hou.paneTabType.SceneViewer).curViewport()
+
     def ray(self):
         d, o = self.vp.mapToWorld(self.dev.x, self.dev.y)
         return o, d
@@ -192,6 +195,7 @@ def run():
     pm = node.hdaModule()
     cam, gt, room = hou.node("/obj/cam1"), hou.node("/obj/gt_cam"), hou.node("/obj/room")
     room_sum = checksum(room)
+    cam_start = [cam.parm(p).eval() for p in pm.PARMS]
     gt_sum = gt.asCode()
     node.setCurrent(True, clear_all_selected=True)
     sv.enterCurrentNodeState()
@@ -266,6 +270,11 @@ def run():
     drv.menu("solve_key")
     dpos, drot, dfoc = cam_error(pm, cam, gt)
     log("after Solve & Key: dpos %.4f  drot %.3f deg  dfocal %.3f%%" % (dpos, drot, dfoc))
+    log("| parm | ground truth | solved | start |")
+    log("|---|---|---|---|")
+    start = dict(zip(pm.PARMS, cam_start))
+    for p_ in pm.PARMS:
+        log("| %s | %.4f | %.4f | %.4f |" % (p_, gt.parm(p_).evalAtFrame(1), cam.parm(p_).eval(), start[p_]))
     check(dfoc < 1.0 and dpos < 0.05 and drot < 0.3, "ground truth recovered (focal within 1%)")
     check(pm.keyed_frames(cam) == [1], "camera keyed at frame 1 only: %s" % pm.keyed_frames(cam))
     check(checksum(room) == room_sum, "reference mesh + network unchanged (checksum)")
@@ -296,6 +305,18 @@ def run():
         check(all(now[i] == vals[i] for i in idx) and now != vals, "%s: locked parms unchanged during solve" % preset)
         hou.undos.performUndo()
     drv.menu("preset_clear")
+
+    # --- a real click may arrive as press + release followed by 'Picked': still one pin
+    n_before = len(pm.pins_at(pm.load_pins(node)))
+    fr = st._frame()
+    corner = pick_corners(pm, room, cam, cam, n=None)[0][-1]
+    c = st._screen(fr, fr.rig.project(fr.W, fr.f, corner[None])[0])[0]
+    drv._send(c[0], c[1], R.Start, left=True, ctrl=True)
+    drv._send(c[0], c[1], R.Changed, ctrl=True)
+    drv._send(c[0], c[1], R.Picked, left=True, ctrl=True)
+    check(len(pm.pins_at(pm.load_pins(node))) == n_before + 1, "Ctrl+click as press/release/picked creates exactly one pin")
+    hou.undos.performUndo()
+    check(len(pm.pins_at(pm.load_pins(node))) == n_before, "pin creation is undoable")
 
     # --- pin flags, selection, delete, deactivate/unlock all
     st.selected = ids[5]

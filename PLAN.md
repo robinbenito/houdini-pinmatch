@@ -15,9 +15,9 @@ build_hda.py           -> hython script, assembles the OBJ HDA from src/ (the .h
 tests/                 -> hython tests (core + GT), GUI smoke test driver, test-scene generator
 ```
 
-* OBJ-level HDA `pinmatch::camera_pin_matcher::1.0` (subnet, no inputs, no geometry of its own).
-  Its default state is the embedded Python viewer state. Select the node, Enter in the viewport
-  (or press the "Enter Tool" button).
+* OBJ-level HDA `pinmatch::camera_pin_matcher::1.0` (subnet, no inputs, no geometry of its own
+  besides the view proxy camera). Its default state is the embedded Python viewer state. Select
+  the node, Enter in the viewport (or press the "Enter Tool" button).
 * The state only *reads* the reference object (`displayNode().geometry()`, `worldTransform()`).
   The mesh is hidden **in this viewport only** via the viewport's visible-object mask and redrawn
   by drawables, so no flag/parm of the mesh is ever touched.
@@ -42,7 +42,7 @@ tests/                 -> hython tests (core + GT), GUI smoke test driver, test-
   (parent/own scale is removed). Verified numerically (1e-8).
 * `Pc = Pw · W⁻¹`, camera looks down −Z.
   `u = ((f/A)·Xc/−Zc − winx)/winsizex + ½`, `v = ((f/Av)·Yc/−Zc − winy)/winsizey + ½`,
-  `Av = A·resy/(resx·pixelaspect)`. To be verified against `toNDC()` for random cameras.
+  `Av = A·resy/(resx·pixelaspect)`. ✅ Matches `toNDC()` to 1e-6 for random rigs.
 * Solve variables are the camera's own local parms `tx ty tz rx ry rz focal` → locks are exact
   (locked parms are simply not variables) and keys stay Euler-continuous. Parent/pre transform are
   constants of the solve, so the result is written straight back into local space.
@@ -69,36 +69,44 @@ previous camera. Status from the numerical rank of the data Jacobian vs free DOF
 
 ## Interaction / display
 
-* Enter: remember viewport camera, link flag, 2D window, visible-object mask; look through the
-  camera, unlink (`lockCameraToView(False)`) so view changes can never write the camera.
-* 2D pan/zoom: ✅ `viewtransform <viewport> window ( xmin xmax ymin ymax )` changes only the
-  viewport's own window (camera `winx/winsize` untouched, still looking through the camera).
-  Wheel = zoom about cursor, MMB = pan, `H` = reset.
-* Navigation lock: ✅ H22 has "Lock Camera/Light Tumbling" but only as a UI action
-  (`h.pane.gview.camlocktumble`, no HOM) → the state consumes wheel/MMB/Alt/Space events, and a
-  watchdog (every event/draw + `CameraSwitched` viewport callback) re-attaches camera + window.
-* Drawables: plate = `GeometryDrawable` **Sprite** (image file, world-space billboard filling the
-  frustum; far = background, near + alpha = foreground); mesh = Line drawable (wire) or Face
-  drawable with baked N·L shading (mode 2); pins = Point/Line drawables; labels = `TextDrawable`;
-  HUD = `SceneViewer.hudInfo`.
-* Undo: ✅ `hou.undos.group` for discrete edits; `SceneViewer.beginStateUndo/endStateUndo` around a
-  drag (one step). Parm-button callbacks are already grouped by Houdini.
-* Keys: ✅ HOM keys default to `bezier()` with non-auto slopes → we set auto slopes (UI default).
-  Live drag writes `Parm.setPending` (✅ = plain set on un-animated parms); commit writes keys.
+* Enter: remember viewport camera, link flag and visible-object mask; look through the asset's
+  **view proxy camera**, unlinked, and hide the reference object in this viewport only.
+* 2D pan/zoom: ❌ `viewtransform <viewport> window (...)` keeps the window but an *unlinked*
+  camera view detaches ~1 s later; ❌ `GeometryViewportCamera.setWindow*` refuses unlinked
+  cameras; the camera's own screen window must not be touched. ✅ Solution: `view_proxy` inside the
+  asset mirrors the target camera by expression (`origin()` for the world transform, `ch()` for
+  the lens) and carries the 2D window in its own `winx/winsize`. Wheel = zoom about cursor,
+  MMB = pan, `H` = reset. The viewport picks up proxy changes asynchronously, so the state calls
+  `setCamera(proxy)` after its own edits and when `onDraw` sees the view lag the camera.
+* Navigation lock: H22's "Lock Camera/Light Tumbling" exists only as a UI action
+  (`h.pane.gview.camlocktumble`, no HOM) → the state consumes wheel/MMB/Alt/Space, and a
+  watchdog (`CameraSwitched` viewport callback, mouse events, resume) re-attaches the view.
+* Mouse ↔ image mapping: uv → viewport pixels is affine and pose independent; measured in
+  `onDraw` (view and camera in sync) and reused by the handlers, so live solves never read a view
+  one redraw behind the camera. Pick rays come from the camera model.
+* Drawables: plate = `GeometryDrawable` **Sprite**, fed an `ImageLayer` at full resolution
+  (file-path sprites are capped at 512 px; `max_resolution` must be ints, set at construction;
+  `loadImageDataFromFile` returns linear values → re-encoded to sRGB); mesh = Line drawable (wire)
+  or Face drawable with baked N·L shading; pins = per-state Locate markers + anchor dots + residual
+  lines; labels = `TextDrawable` with `hou.Color`; HUD = `SceneViewer.hudInfo`.
+* Undo: `hou.undos.group` for discrete edits; `SceneViewer.beginStateUndo/endStateUndo` around a
+  create/drag (opened on the first real movement, so plain clicks leave no undo entry).
+* Keys: HOM keys default to `bezier()` with non-auto slopes → auto slopes set explicitly (the UI
+  default). Live drag writes `Parm.setPending` (= plain set on un-animated parms).
 
-## H22 APIs still to verify in the GUI (stage 1–2)
+## Verification status
 
-* Sprite drawable size/aspect semantics (`pscale`, `spritescale`), `images`/`max_resolution`,
-  per-frame image switching, `Alpha`, depth vs scene geometry (`fade_factor`).
-* `TextDrawable` drawn several times per `onDraw` with different params.
-* Whether Space/Alt navigation reaches `onKeyEvent`/`onMouseEvent` (can it be consumed?).
-* `GeometryViewportSettings.setVisibleObjects` mask syntax for excluding one object.
-* `beginStateUndo` + many parm writes during a drag = one undo entry.
+All stages implemented and tested (see TESTLOG.md). Verified in H22.0.368: camera model vs
+`worldTransform`/`toNDC`, sprite/ImageLayer plate, drawable parameter types, `TextDrawable`
+multi-draw per `onDraw`, visible-object mask (`"* ^/obj/room"`), state undo grouping, hotkey
+registration (`PluginHotkeyDefinitions` + `viewerstate.utils.defineHotkey`), embedded-state
+install hooks. Not verifiable here: raw OS input dispatch (Space+drag, real Ctrl/⌘+click) –
+synthetic Qt events don't reach viewer states and computer-use access was not granted.
 
 ## Stages
 
-1. HDA skeleton + state: camera lock, 2D pan/zoom, plate + mesh display.
-2. Pins: create (snap), drag, select, delete, flags, drawing, JSON storage, undo.
-3. Solver with locks/presets/regularisation, live solve while dragging.
-4. Timeline: keys on commit, copy pins, ghosts, per-frame delete, keyed-frame list.
-5. HUD, safety checks, README, test scene + GT test log.
+1. ✅ HDA skeleton + state: camera lock, 2D pan/zoom, plate + mesh display.
+2. ✅ Pins: create (snap), drag, select, delete, flags, drawing, JSON storage, undo.
+3. ✅ Solver with locks/presets/regularisation, live solve while dragging.
+4. ✅ Timeline: keys on commit, copy pins, ghosts, per-frame delete, keyed-frame list.
+5. ✅ HUD, safety checks, README, test scene + GT test log.
