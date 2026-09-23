@@ -4,6 +4,8 @@
 
 Creates scenes/pinmatch_test.hip(lc|nc) with
   /obj/room    simple room + furniture (the reference mesh)
+  /obj/scan    the room as a dense noisy mesh (~1M triangles), display off
+  /obj/splat   the room as Gaussian splats (Houdini GSplat attributes) with floaters, display off
   /obj/gt_cam  ground-truth camera (animated 1-24), used to render the plate
   /obj/cam1    camera to be solved, deliberately wrong start pose/focal
   /obj/camera_pin_matcher1   the HDA node, wired to cam1/room/plate (if the HDA is built)
@@ -62,6 +64,72 @@ def build_room():
     return geo
 
 
+def build_scan():
+    """The room as a dense, slightly noisy triangle mesh (~1M triangles), like a scan. Display off."""
+    geo = hou.node("/obj").createNode("geo", "scan")
+    merge = geo.createNode("object_merge")
+    merge.parm("objpath1").set("/obj/room/OUT")
+    sub = geo.createNode("subdivide")
+    sub.setInput(0, merge)
+    sub.parm("algorithm").set("osdbilinear")          # keeps the shape and the original corners
+    sub.parm("iterations").set(7)
+    tri = geo.createNode("divide")
+    tri.setInput(0, sub)
+    noise = geo.createNode("attribwrangle", "scan_noise")
+    noise.setInput(0, tri)
+    noise.parm("snippet").set("@P += (noise(@P * 7.0) - 0.5) * 0.004;     // +-2 mm")
+    out = geo.createNode("null", "OUT")
+    out.setInput(0, noise)
+    out.setDisplayFlag(True)
+    geo.layoutChildren()
+    geo.setDisplayFlag(False)
+
+
+def build_splat():
+    """The room as Gaussian splats with Houdini's GSplat attributes (what the Bake GSplats SOP makes
+    of a .ply): flat discs on the surfaces plus faint floaters in the air. Display off."""
+    geo = hou.node("/obj").createNode("geo", "splat")
+    merge = geo.createNode("object_merge")
+    merge.parm("objpath1").set("/obj/room/OUT")
+    scatter = geo.createNode("scatter::2.0")
+    scatter.setInput(0, merge)
+    scatter.parm("npts").set(500000)
+    scatter.parm("relaxpoints").set(0)
+    discs = geo.createNode("attribwrangle", "gsplat_attribs")
+    discs.setInput(0, scatter)
+    discs.setInput(1, merge)
+    discs.parm("snippet").set("""
+int prim; vector uvw;
+xyzdist(1, @P, prim, uvw);
+v@Cd = prim(1, "Cd", prim);
+p@orient = dihedral({0, 0, 1}, normalize(prim_normal(1, prim, uvw)));    // disc normal = surface normal
+float s = 0.03 * (0.7 + 0.6 * rand(@ptnum));
+v@scale = set(s, s * (0.5 + 0.5 * rand(@ptnum + 7)), s * 0.1);
+f@GS_Alpha = 0.6 + 0.4 * rand(@ptnum + 3);
+""")
+    floaters = geo.createNode("attribwrangle", "floaters")
+    floaters.setInput(0, discs)
+    floaters.parm("class").set("detail")
+    floaters.parm("snippet").set("""
+for (int i = 0; i < 400; i++) {
+    int pt = addpoint(0, set(fit01(rand(i), -3.5, 3.5), fit01(rand(i + 1000), 0.2, 3.0), fit01(rand(i + 2000), -4.5, 4.5)));
+    vector cd = set(rand(i + 3), rand(i + 4), rand(i + 5));
+    vector axis = normalize(set(rand(i + 7) - 0.5, rand(i + 8) - 0.5, rand(i + 9) - 0.5));
+    vector4 q = quaternion(radians(360 * rand(i + 6)), axis);
+    vector sc = set(0.03, 0.03, 0.03) * (0.5 + rand(i + 10));
+    setpointattrib(0, "Cd", pt, cd);
+    setpointattrib(0, "orient", pt, q);
+    setpointattrib(0, "scale", pt, sc);
+    setpointattrib(0, "GS_Alpha", pt, 0.15 + 0.3 * rand(i + 11));
+}
+""")
+    out = geo.createNode("null", "OUT")
+    out.setInput(0, floaters)
+    out.setDisplayFlag(True)
+    geo.layoutChildren()
+    geo.setDisplayFlag(False)
+
+
 def camera(name, t, r, focal):
     cam = hou.node("/obj").createNode("cam", name)
     cam.parmTuple("t").set(t)
@@ -85,6 +153,8 @@ def build_scene():
     hou.playbar.setPlaybackRange(*FRAMES)
     hou.setFrame(FRAMES[0])
     build_room()
+    build_scan()
+    build_splat()
 
     gt = camera("gt_cam", GT["t"], GT["r"], GT["focal"])
     for name, a, b in (("t", GT["t"], GT_END["t"]), ("r", GT["r"], GT_END["r"])):

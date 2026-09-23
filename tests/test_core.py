@@ -197,6 +197,61 @@ def test_protected_parms():
     print("protected parms: %s treated as locked, look-at disables solving" % sorted(prot))
 
 
+def test_splat_hit():
+    """Ray hits on Gaussian splats and plain point clouds: the first visible surface, not stray points."""
+    q = rng.normal(size=(20, 4))
+    R = pm._quat_matrices(q)
+    for qi, Ri in zip(q, R):                       # local = world @ R, i.e. R is the transpose of Houdini's
+        hq = hou.Quaternion(*(qi / np.linalg.norm(qi)))
+        assert np.allclose(Ri, np.array(hq.extractRotationMatrix3().asTupleOfTuples()).T, atol=1e-6)
+    # a wall of flat splats facing the camera at z = -5 (another at z = -8), faint floaters in front
+    n = 40000
+    wall = np.c_[rng.uniform(-3, 3, (n, 2)), np.full(n, -5.0)]
+    back = wall + [0.0, 0.0, -3.0]
+    floaters = np.c_[rng.uniform(-3, 3, (300, 2)), rng.uniform(-4.5, -0.5, 300)]
+    P = np.r_[wall, back, floaters]
+    spin = np.c_[np.zeros((2 * n, 2)), np.sin(rng.uniform(0, np.pi, 2 * n)), np.ones(2 * n)]   # about z
+    orient = np.r_[spin, rng.normal(size=(300, 4))]
+    sigma = np.r_[np.tile([0.05, 0.03, 0.002], (2 * n, 1)), np.full((300, 3), 0.05)]
+    alpha = np.r_[np.full(2 * n, 0.8), np.full(300, 0.2)]
+    worst = 0.0
+    for d in rng.uniform(-0.4, 0.4, (30, 2)):
+        d = np.r_[d, -1.0]
+        t, i = pm.splat_hit((0, 0, 0), d, P, sigma, alpha, orient)
+        worst = max(worst, abs(t * d[2] + 5.0))
+        assert i < n, "strongest splat must be on the front wall"
+    assert worst < 0.01, worst
+    t, i = pm.splat_hit((0, 0, 0), P[2 * n] * [1, 1, 1], P, sigma, alpha * 0 + 0.99, orient)
+    assert i == 2 * n and abs(t - 1.0) < 1e-6, "an opaque floater on the ray is what the ray sees"
+    # plain point cloud: pixel-sized Gaussians, same scene without splat attributes
+    worst_pc = 0.0
+    for d in rng.uniform(-0.4, 0.4, (30, 2)):
+        d = np.r_[d, -1.0]
+        t, i = pm.splat_hit((0, 0, 0), d, P, px=1.0 / 1500)
+        worst_pc = max(worst_pc, abs(t * d[2] + 5.0))
+    assert worst_pc < 0.01, worst_pc
+    assert pm.splat_hit((0, 0, 0), (0, 0, 1), P, sigma, alpha, orient) is None
+    t0 = time.time()
+    big = np.tile(P, (30, 1))                      # ~2.4 M splats
+    pm.splat_hit((0, 0, 0), (0.1, 0.1, -1), big, np.tile(sigma, (30, 1)), np.tile(alpha, 30), np.tile(orient, (30, 1)))
+    dt = time.time() - t0
+    print("splats: depth error %.4f (splats) / %.4f (plain points), %d splats picked in %.0f ms" % (worst, worst_pc, len(big), dt * 1000))
+    assert dt < 1.0
+
+
+def test_polygons():
+    g = hou.Geometry()
+    hou.sopNodeTypeCategory().nodeVerb("box").execute(g, [])
+    assert pm.polygons(g) is g
+    soup, packed = hou.Geometry(), hou.Geometry()
+    hou.sopNodeTypeCategory().nodeVerb("polysoup").execute(soup, [g])
+    hou.sopNodeTypeCategory().nodeVerb("pack").execute(packed, [soup])
+    for src in (soup, packed):
+        out = pm.polygons(src)
+        assert out.countPrimType(hou.primType.Polygon) == 6 == out.intrinsicValue("primitivecount"), src
+    print("polygons: packed and polysoup references are converted for the drawables")
+
+
 def test_hda():
     """Asset-level behaviour in a fresh scene: callbacks, resolution matching, undo grouping."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

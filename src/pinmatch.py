@@ -90,6 +90,91 @@ def _roll(C):
 
 
 # --------------------------------------------------------------------------------------------
+# Reference geometry: polygon view for drawables, ray hits on Gaussian splats / point clouds
+# --------------------------------------------------------------------------------------------
+def polygons(geo):
+    """`geo` if it is all polygons, else an unpacked copy with polysoups etc. converted to polygons
+    (GeometryDrawables refuse anything but polygons)."""
+    if geo.countPrimType(hou.primType.Polygon) == geo.intrinsicValue("primitivecount"):
+        return geo
+    cat = hou.sopNodeTypeCategory()
+    unpacked, out = hou.Geometry(), hou.Geometry()
+    cat.nodeVerb("unpack").execute(unpacked, [geo])
+    cat.nodeVerb("convert").execute(out, [unpacked])
+    return out
+
+
+def _quat_matrices(q):
+    """Houdini quaternions (n,4) = (x, y, z, w) -> R (n,3,3) with local = world @ R."""
+    q = q / np.linalg.norm(q, axis=1, keepdims=True)
+    x, y, z, w = q.T
+    return np.stack([np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], 1),
+                     np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], 1),
+                     np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], 1)], 1)
+
+
+def splat_hit(o, d, P, sigma=None, alpha=None, orient=None, px=1e-3, cutoff=3.0):
+    """Where a ray meets a cloud of 3D Gaussians, composited front to back as splat renderers do.
+
+    o, d: ray origin and direction. P (n,3): centres. sigma (n,3): standard deviations along each
+    Gaussian's local axes, rotated by `orient` (n,4 Houdini quaternions); alpha (n,): opacities.
+    Without sigma (a plain point cloud) every point is a round Gaussian of 2, 5 or 12 pixels at its
+    distance (`px` = angle of one pixel) with alpha 0.5; the nearest surface that turns the ray
+    opaque at any of these sizes wins, so sparse surfaces still count and stray points don't.
+    A Gaussian contributes its peak along the ray, alpha * exp(-m^2 / 2) at depth t*, where m is the
+    ray's closest Mahalanobis distance to the centre. Returns (t, i) with o + t*d the median depth
+    (where accumulated opacity reaches 0.5; the strongest splat's depth if the ray never gets that
+    opaque) and i the visibly contributing splat nearest to that point, or None if nothing along the
+    ray reaches 2 %.
+    """
+    o, d, P = np.asarray(o, float), np.asarray(d, float), np.asarray(P)
+    v = P - o
+    t = v @ (d / np.linalg.norm(d))
+    perp2 = np.einsum("ij,ij->i", v, v) - t * t
+    if sigma is not None:
+        sigma = np.asarray(sigma, float).reshape(len(P), -1)
+        return _composite(o, d, P, t, perp2, sigma, sigma.max(1), alpha, orient, cutoff)
+    best = None
+    for k in (2.0, 5.0, 12.0):     # smallest size that sees a surface, unless a larger one finds one clearly in front
+        h = _composite(o, d, P, t, perp2, None, k * px * np.maximum(t, 0.0), None, None, cutoff, True)
+        if h and (best is None or h[0] < best[0] * (1.0 - cutoff * k * px)):
+            best = h
+    return best or _composite(o, d, P, t, perp2, None, 12.0 * px * np.maximum(t, 0.0), None, None, cutoff)
+
+
+def _composite(o, d, P, t, perp2, sigma, smax, alpha, orient, cutoff, need_opaque=False):
+    c = np.flatnonzero((t > 0) & (perp2 < (cutoff * smax) ** 2))
+    if not len(c):
+        return None
+    a, b = o - P[c], np.broadcast_to(d, (len(c), 3))
+    if orient is not None:
+        R = _quat_matrices(np.asarray(orient, float)[c])
+        a, b = np.einsum("mj,mjk->mk", a, R), np.einsum("mj,mjk->mk", b, R)
+    s = smax[c, None] if sigma is None else sigma[c]
+    a, b = a / s, b / s
+    ab, bb = np.einsum("ij,ij->i", a, b), np.einsum("ij,ij->i", b, b)
+    ts = -ab / bb
+    r = (0.5 if alpha is None else np.asarray(alpha, float)[c]) * np.exp(-0.5 * (np.einsum("ij,ij->i", a, a) - ab * ab / bb))
+    order = np.argsort(ts)
+    ts, r, c = ts[order], r[order], c[order]
+    T = np.cumprod(np.r_[1.0, 1.0 - r[:-1]])            # transmittance in front of each splat
+    w = r * T
+    if w.max() < 0.02:
+        return None
+    opaque = np.flatnonzero(1.0 - T * (1.0 - r) >= 0.5)
+    if need_opaque and not len(opaque):
+        return None
+    k = opaque[0] if len(opaque) else np.argmax(w)
+    t_hit = float(ts[k])
+    if sigma is None:          # round stand-ins scatter in depth across an oblique surface: average that layer
+        band = np.abs(ts - t_hit) < cutoff * smax[c[k]] / np.linalg.norm(d)
+        t_hit = float(np.average(ts[band], weights=r[band] + 1e-12))
+    seen = np.flatnonzero(w >= 0.1 * w.max())
+    near = seen[np.argmin(np.linalg.norm(P[c[seen]] - (o + t_hit * d), axis=1))]
+    return t_hit, int(c[near])
+
+
+# --------------------------------------------------------------------------------------------
 # Solver
 # --------------------------------------------------------------------------------------------
 def solve(rig, P, UV, free, anchor, start=None, weight=1.0, lock_roll=False,

@@ -120,6 +120,10 @@ def refresh(st=None):
         st._sync_view()          # the viewport picks up script-driven camera/time changes asynchronously
     hou.ui.paneTabOfType(hou.paneTabType.SceneViewer).curViewport().draw()
     QtWidgets.QApplication.processEvents()
+    for _ in range(20):          # the test is one main-thread job: Houdini's idle loop never runs the
+        if not hdefereval._queue:     # state's deferred work (view sync, near clip) in between
+            break
+        hdefereval._processDeferred()
 
 
 def checksum(obj):
@@ -185,6 +189,209 @@ def next_corner(pm, room, cam, gt, used_uv):
     else:
         i = int(np.argmax(np.min(np.linalg.norm(uv[:, None] - np.array(used_uv)[None], axis=2), axis=1)))
     return P[i], uv[i]
+
+
+def viewport_image(vp):
+    """What the viewport shows (drawables included): (QImage in device pixels, pixel ratio, height)."""
+    from PySide6 import QtOpenGLWidgets
+    w, h = vp.size()[2:]
+    gl = next(g for g in hou.qt.mainWindow().findChildren(QtOpenGLWidgets.QOpenGLWidget)
+              if g.objectName() == "RE_WindowDrawable" and g.isVisible() and (g.width(), g.height()) == (w, h))
+    return gl.grabFramebuffer(), gl.devicePixelRatioF(), h
+
+
+def magenta_near(shot, p, r=3):
+    """Number of pure-magenta (test wire colour) pixels within r px of viewport point p (origin bottom-left)."""
+    img, dpr, h = shot
+    cx, cy, k = p[0] * dpr, (h - p[1]) * dpr, int(r * dpr)
+    return sum(c.red() > 190 and c.green() < 80 and c.blue() > 190
+               for c in (img.pixelColor(int(cx) + dx, int(cy) + dy) for dx in range(-k, k + 1) for dy in range(-k, k + 1)))
+
+
+def edge_samples(pm, st, geo, clear_px=12.0):
+    """Screen midpoints of mesh edges seen / hidden from the current camera: inside the frame, right of
+    the HUD, at least clear_px from every other edge, so a wire drawn there can only be that edge."""
+    fr = st._frame()
+    o = fr.W[3, :3]
+    segs = {}                                             # unique edges (neighbouring faces share them)
+    for prim in geo.prims():
+        pts = [np.array(v.point().position()) for v in prim.vertices()]
+        for a, b in zip(pts, pts[1:] + pts[:1]):
+            segs[tuple(sorted((tuple(np.round(a, 6)), tuple(np.round(b, 6)))))] = (a, b)
+    segs = list(segs.values())
+    screen = []                                           # edges clipped to the front of the camera
+    for a, b in segs:
+        (za, zb) = fr.rig.project(fr.W, fr.f, np.array([a, b]))[1]
+        if max(za, zb) <= 0.01:
+            screen.append(None)
+            continue
+        if min(za, zb) < 0.01:
+            a, b = (a + (b - a) * (0.01 - za) / (zb - za), b) if za < 0.01 else (a, b + (a - b) * (0.01 - zb) / (za - zb))
+        screen.append(st._screen(fr, fr.rig.project(fr.W, fr.f, np.array([a, b]))[0]))
+    vis, hid = [], []
+    for i, (a, b) in enumerate(segs):
+        m = (a + b) / 2
+        uv, z = fr.rig.project(fr.W, fr.f, m[None])
+        if z[0] <= 0.1 or not (0.45 < uv[0, 0] < 0.95 and 0.08 < uv[0, 1] < 0.92):
+            continue
+        p = st._screen(fr, uv)[0]
+        clear = True
+        for j, s in enumerate(screen):
+            if j != i and s is not None:
+                ab = s[1] - s[0]
+                t = np.clip(np.dot(p - s[0], ab) / max(np.dot(ab, ab), 1e-9), 0, 1)
+                clear &= np.linalg.norm(s[0] + t * ab - p) > clear_px
+        if clear:
+            d = m - o
+            hit = hou.Vector3()
+            blocked = geo.intersect(hou.Vector3(o), hou.Vector3(d / np.linalg.norm(d)), hit, hou.Vector3(),
+                                    hou.Vector3()) >= 0 and np.linalg.norm(np.array(hit) - o) < np.linalg.norm(d) - 0.05
+            (hid if blocked else vis).append(p)
+    return vis, hid
+
+
+def timed(fn):
+    t = time.time()
+    fn()
+    return time.time() - t
+
+
+def reference_display(st, node, drv, check, pm, cam, room):
+    """Hidden-line display (checked on rendered pixels), tool-view near clip, the W hotkey, pins on a
+    dense scan and on Gaussian splats."""
+    vp = st.vp
+    hou.setFrame(20)                                      # no pins on this frame
+    node.parm("showghosts").set(0)
+    node.parmTuple("wirecolor").set((1.0, 0.0, 1.0))
+    node.parm("wireopacity").set(1.0)
+    refresh(st)
+    viewport_image(vp)                                    # draw once: the state measures its uv -> pixel map
+    vis, hid = edge_samples(pm, st, room.displayNode().geometry())
+    drawn = {}
+    for disp in ("wire", "hidden", "ghost", "shaded"):
+        node.parm("meshdisplay").set(disp)
+        refresh(st)
+        refresh(st)
+        shot = viewport_image(vp)
+        drawn[disp] = [magenta_near(shot, p) > 0 for p in vis], [magenta_near(shot, p) > 0 for p in hid]
+    check(len(vis) >= 3 and len(hid) >= 2 and all(drawn["wire"][0] + drawn["wire"][1])
+          and all(all(drawn[d][0]) and not any(drawn[d][1]) for d in ("hidden", "ghost", "shaded")),
+          "hidden line: %d visible and %d hidden edges all drawn in wireframe; in hidden line, ghost and shaded "
+          "the visible ones are drawn and the hidden ones are not (rendered pixels)" % (len(vis), len(hid)))
+    near = node.node("view_proxy").parm("near").eval()
+    check(near == max(cam.parm("near").eval(), node.parm("view_near").eval()) and 0.005 < near < 0.05
+          and cam.parm("near").eval() == 0.001, "tool view near clip fitted to the reference (%.4f); camera's near untouched" % near)
+    node.parm("meshdisplay").set("wire")
+    seq = []
+    for _ in range(4):
+        drv.menu("cycle_display")
+        seq.append(node.parm("meshdisplay").evalAsString())
+    check(seq == ["hidden", "ghost", "shaded", "wire"], "W cycles the mesh display: %s" % seq)
+    node.parm("meshdisplay").set("hidden")
+
+    def pin_at(p):
+        """Ctrl+click at viewport point p; returns the new pin's anchor and removes the pin again."""
+        n0 = len(pm.pins_at(pm.load_pins(node)))
+        drv._send(p[0], p[1], R.Start, left=True, ctrl=True)
+        drv._send(p[0], p[1], R.Changed, ctrl=True)
+        pins = pm.pins_at(pm.load_pins(node))
+        if len(pins) == n0:
+            return None
+        hou.undos.performUndo()
+        return np.array(pins[-1]["p"])
+
+    # dense scan (~1M triangles): cached once per cook, point snapping, hidden points ignored
+    scan = hou.node("/obj/scan")
+    scan_sum = checksum(scan)
+    t = time.time()
+    node.parm("refgeo").set(scan.path())
+    refresh(st)
+    viewport_image(vp)
+    ref = st._ref()
+    log("scan: %d triangles, set as reference and first drawn in %.2fs" % (ref.count, time.time() - t))
+    node.parm("meshdisplay").set("ghost")
+    draw = lambda: (refresh(st), viewport_image(vp))
+    log("scan: first ghost draw (shading baked) %.2fs, next draw %.3fs" % (timed(draw), timed(draw)))
+    node.parm("meshdisplay").set("hidden")
+    fr = st._frame()
+    P, _ = pick_corners(pm, room, cam, cam, n=None)
+    uv, _ = fr.rig.project(fr.W, fr.f, P)
+    corner = P[np.argmin(np.linalg.norm(uv - 0.5, axis=1))]
+    t = time.time()
+    got = pin_at(st._screen(fr, fr.rig.project(fr.W, fr.f, corner[None])[0])[0] + [0.4, -0.3])
+    t_pick = time.time() - t
+    check(got is not None and np.linalg.norm(got - corner) < 0.015,            # vertices ~3-80 mm apart
+          "dense scan: Ctrl+click on a corner snaps to a vertex at it (error %.4f, %.0f ms incl. pin creation)"
+          % (np.linalg.norm(got - corner) if got is not None else -1, t_pick * 1000))
+    geo = room.displayNode().geometry()
+    Pall = np.array(geo.pointFloatAttribValues("P")).reshape(-1, 3)
+    uv, z = fr.rig.project(fr.W, fr.f, Pall)
+    o = fr.W[3, :3]
+    hidden = []
+    for p, u, zz in zip(Pall, uv, z):
+        d = p - o
+        hit = hou.Vector3()
+        if zz > 0.5 and np.all((u > 0.1) & (u < 0.9)) and geo.intersect(
+                hou.Vector3(o), hou.Vector3(d / np.linalg.norm(d)), hit, hou.Vector3(), hou.Vector3()) >= 0 \
+                and np.linalg.norm(np.array(hit) - o) < np.linalg.norm(d) - 0.1:
+            hidden.append(p)
+    check(hidden, "test setup: a room corner is hidden from this camera")
+    if hidden:
+        got = pin_at(st._screen(fr, fr.rig.project(fr.W, fr.f, hidden[0][None])[0])[0])
+        seen = False
+        if got is not None:
+            d = got - o
+            hit = hou.Vector3()
+            seen = ref.geo.intersect(hou.Vector3(o), hou.Vector3(d / np.linalg.norm(d)), hit, hou.Vector3(),
+                                     hou.Vector3()) >= 0 and np.linalg.norm(np.array(hit) - o) > np.linalg.norm(d) - 0.01
+        check(seen and np.linalg.norm(got - hidden[0]) > 0.05, "hidden line: a click on a hidden corner snaps to a visible point")
+    check(checksum(scan) == scan_sum, "dense scan unchanged")
+
+    # Gaussian splats: drawn by the viewport, pins land on the splat surface / on splat centres
+    splat = hou.node("/obj/splat")
+    splat.setDisplayFlag(True)
+    splat_sum = checksum(splat)
+    node.parm("refgeo").set(splat.path())
+    refresh(st)
+    ref = st._ref()
+    check(ref.kind == "splat" and "^" + splat.path() not in vp.settings().visibleObjects(),
+          "Gaussian splats recognised (%d) and left to the viewport to draw" % ref.count)
+    centers = []
+    for prim in geo.prims():                     # visible face centres of the room, not seen at a grazing angle
+        c = np.mean([np.array(v.point().position()) for v in prim.vertices()], axis=0)
+        u, zc = fr.rig.project(fr.W, fr.f, c[None])
+        d = c - o
+        hit = hou.Vector3()
+        if zc[0] > 0.5 and np.all((u > 0.2) & (u < 0.8)) and abs(np.dot(prim.normal(), d / np.linalg.norm(d))) > 0.5 \
+                and geo.intersect(
+                hou.Vector3(o), hou.Vector3(d / np.linalg.norm(d)), hit, hou.Vector3(), hou.Vector3()) >= 0 \
+                and np.linalg.norm(np.array(hit) - c) < 1e-3:
+            centers.append(c)
+    Psplat = np.array(splat.displayNode().geometry().pointFloatAttribValues("P")).reshape(-1, 3)
+    err_s, err_p, on_splat, times = [], [], [], []
+    for mode in ("surface", "points"):
+        node.parm("snap").set(mode)
+        for c in centers:
+            t = time.time()
+            got = pin_at(st._screen(fr, fr.rig.project(fr.W, fr.f, c[None])[0])[0])
+            times.append(time.time() - t)
+            if got is None:
+                err_s.append(np.inf)
+                continue
+            (err_s if mode == "surface" else err_p).append(np.linalg.norm(got - c))
+            if mode == "points":
+                on_splat.append(np.min(np.linalg.norm(Psplat - got, axis=1)) < 1e-4)
+    node.parm("snap").set("points")
+    check(len(centers) >= 3 and max(err_s) < 0.01 and max(err_p) < 0.05 and all(on_splat),
+          "splats: %d clicks on the surface land within %.1f mm (surface) / on a splat centre within %.1f cm (points); "
+          "%.0f ms per pick of %d splats" % (len(centers), max(err_s) * 1000, max(err_p) * 100,
+                                             1000 * np.mean(times), ref.count))
+    check(checksum(splat) == splat_sum, "splat unchanged")
+    splat.setDisplayFlag(False)
+    node.parm("refgeo").set(room.path())
+    for p in ("showghosts", "wirecolor", "wireopacity", "meshdisplay"):
+        node.parmTuple(p).revertToDefaults()
+    hou.setFrame(1)
 
 
 # ------------------------------------------------------------------ the test
@@ -387,21 +594,50 @@ def run():
     hou.undos.performUndo()
     check(pm.pin_frames(pm.load_pins(node)) == [1, 12], "delete all is undoable")
 
+    reference_display(st, node, drv, check, pm, cam, room)
+
     # --- display modes (visual check images)
     hou.setFrame(1)
-    for mode in ("bg", "fg"):
-        node.parm("platemode").set(mode)
+    for name, plate, disp, ref in (("wire", "bg", "wire", "room"), ("hidden", "bg", "hidden", "room"),
+                                   ("ghost", "bg", "ghost", "room"), ("shaded", "fg", "shaded", "room"),
+                                   ("scan", "bg", "hidden", "scan"), ("splat", "fg", "hidden", "splat")):
+        hou.node("/obj/splat").setDisplayFlag(ref == "splat")
+        room.setDisplayFlag(ref != "splat")               # the test scene's room would show through the splat
+        node.parm("refgeo").set("/obj/" + ref)
+        node.parm("platemode").set(plate)
+        node.parm("meshdisplay").set(disp)
+        node.parm("wireopacity").set(0.35 if ref == "scan" else 0.7)
         refresh(st)
-        img = os.path.join(ROOT, "tests", "gui_%s.png" % mode)
+        refresh(st)
+        img = os.path.join(ROOT, "tests", "gui_%s.png" % name)
         hou.qt.mainWindow().grab().save(img)
         log("saved screenshot", os.path.relpath(img, ROOT))
-    node.parm("platemode").set("bg")
+    hou.node("/obj/splat").setDisplayFlag(False)
+    room.setDisplayFlag(True)
+    node.parm("refgeo").set("/obj/room")
+    for p in ("platemode", "meshdisplay", "wireopacity"):
+        node.parm(p).revertToDefaults()
 
-    # --- exit state restores the viewport, persistence across save/load
+    # --- exit state restores the viewport (also after the deferred work it queued), persistence
     sv.setCurrentState("objview")
+    refresh()
     check(vp.camera() != node.node("view_proxy") and vp.settings().visibleObjects() == "*",
-          "leaving the tool restores the viewport (camera, visible objects)")
+          "leaving the tool restores the viewport (camera, visible objects), and nothing re-attaches it later")
     check(checksum(room) == room_sum, "reference mesh still unchanged after all operations")
+    # A session that never reached onExit (asset reinstalled while active, crash) left its exclusion in
+    # the viewport mask; the node kept the user's mask. The next session must restore that one.
+    base = vp.settings().visibleObjects()
+    for stored, leftover in ((base, " ^/obj/scan"), ("", " ^/obj/room ^/obj/room")):
+        vp.settings().setVisibleObjects(base + leftover)
+        node.parm("view_mask").set(stored)
+        node.setCurrent(True, clear_all_selected=True)
+        sv.enterCurrentNodeState()
+        refresh()
+        sv.setCurrentState("objview")
+        refresh()
+        check(vp.settings().visibleObjects() == base and node.parm("view_mask").eval() == "",
+              "exclusions left behind by an earlier session (%r, user's mask %s) are cleaned up: restored to %r"
+              % (leftover.strip(), "kept on the node" if stored else "not kept", base))
     pins_json, keys = node.parm("pins").eval(), {p: [(k.frame(), k.value()) for k in cam.parm(p).keyframes()] for p in pm.PARMS}
     tmp = os.path.join(tempfile.mkdtemp(), "persist.hip" + EXT)
     hou.hipFile.save(tmp)

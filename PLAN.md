@@ -95,6 +95,23 @@ previous camera. Status from the numerical rank of the data Jacobian vs free DOF
 * Keys: HOM keys default to `bezier()` with non-auto slopes → auto slopes set explicitly (the UI
   default). Live drag writes `Parm.setPending` (= plain set on un-animated parms).
 
+## Dense scans and Gaussian splats
+
+* Mesh display: Wireframe (all edges), Hidden Line, Hidden Line Ghost, Shaded, with Wire Opacity.
+  Hidden line stays inside the drawables: a Face drawable with alpha 0 writes their shared
+  depth buffer (no colour, so the plate shows through), and the Line drawable, pulled 0.2 %
+  toward the eye because drawables have no polygon offset, fails the depth test behind
+  surfaces. ❌ Testing the lines against the natively drawn mesh (`fade_factor` 0) leaks dashes.
+* Depth precision: the tool view's near clip (proxy `near`) is fitted to the reference's
+  distance and size; the camera's 0.001 breaks hidden line on distant surfaces.
+* The reference is prepared once per SOP cook (not per frame); packed prims and polysoups are
+  converted to polygons (drawables refuse anything else).
+* Gaussian splats (Houdini 22 SOP GSplats: `GS_Alpha`, `Cd`, `scale`, `orient`) are drawn by
+  the viewport, not masked. Pins: the cursor ray is composited front to back through the
+  Gaussians (peak response along the ray, `alpha·exp(-m²/2)`), and the anchor is where it
+  turns 50 % opaque; Points snapping takes the nearest contributing splat centre. Plain point
+  clouds use pixel-sized round Gaussians.
+
 ## Verification status
 
 All stages implemented and tested (see TESTLOG.md). Verified in H22.0.368: camera model vs
@@ -111,3 +128,4 @@ synthetic Qt events don't reach viewer states and computer-use access was not gr
 3. ✅ Solver with locks/presets/regularisation, live solve while dragging.
 4. ✅ Timeline: keys on commit, copy pins, ghosts, per-frame delete, keyed-frame list.
 5. ✅ HUD, safety checks, README, test scene + GT test log.
+6. ✅ Dense scans (hidden line, ghost, wire opacity, per-cook caching) and Gaussian splats.

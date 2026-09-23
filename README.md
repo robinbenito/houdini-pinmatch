@@ -4,15 +4,18 @@ Match a camera to existing scene geometry by pinning mesh points onto a plate. E
 3D point on a reference mesh plus a 2D position on the plate; you drag pins onto the matching
 plate features in the viewport and a solver moves, rotates and zooms the camera until they
 line up. The same workflow as Nuke's PointsTo3D or fSpy, but interactive in the Houdini
-viewport, with keys on the timeline for a rough matchmove.
+viewport, with keys on the timeline for a rough matchmove. The reference can be a simple
+model, a dense scan (millions of polygons) or a Gaussian splat.
 
 **The geometry is never modified.** Only the target camera's `tx ty tz rx ry rz focal` are
 written. The tool doesn't touch the reference object, its parents or anything upstream of it,
 and a test verifies this with a checksum.
 
-| Plate in background, mesh as wireframe | Plate over shaded mesh (50 %) |
+| Hidden line: only the visible edges, over the plate | Hidden line ghost: visible edges on a see-through surface |
 |---|---|
-| ![background mode](docs/tool_bg.jpg) | ![foreground mode](docs/tool_fg.jpg) |
+| ![hidden line](docs/tool_hidden.jpg) | ![hidden line ghost](docs/tool_ghost.jpg) |
+| **Dense scan** (1M triangles, wire opacity 0.35) | **Gaussian splat** drawn by Houdini, plate over it at 50 % |
+| ![dense scan](docs/tool_scan.jpg) | ![gaussian splat](docs/tool_splat.jpg) |
 
 Each pin shows a target marker (four arrows) where it sits on the plate, a dot where its 3D anchor
 projects through the current camera, a residual line between the two, and its id and error in
@@ -25,7 +28,8 @@ otls/camera_pin_matcher.hdalc   the asset (OBJ level, embedded Python viewer sta
 src/pinmatch.py                 asset PythonModule: camera model, solver, pin storage, keys, buttons
 src/pinmatch_state.py           asset ViewerStateModule: the interactive tool
 build_hda.py                    rebuilds the asset from src/ (hython build_hda.py)
-scenes/pinmatch_test.hiplc      test scene: room mesh, ground-truth camera, camera to solve
+scenes/pinmatch_test.hiplc      test scene: room mesh, the room as a dense scan and as Gaussian splats,
+                                ground-truth camera, camera to solve
 scenes/plate/plate.####.jpg     24-frame plate rendered (Karma) from the ground-truth camera
 tests/                          headless tests, GUI integration test, scene generator
 dev/                            remote-control harness for a GUI Houdini (development only)
@@ -52,6 +56,14 @@ Install the asset in one of these ways:
 
 The node is **Camera Pin Matcher** in the OBJ Tab menu.
 
+After `hython build_hda.py` the file is read-only: Houdini can't save into it or delete the
+asset from it (**Save Operator Type** and **Delete** in the Asset Manager fail). To pick up a
+rebuild in an open session, run `hou.hda.reloadFile("<path to the .hdalc>")` in the Python
+Shell.
+
+**Leave the tool (Esc) before the asset file is rebuilt or replaced.** Houdini crashes if the
+file changes while the tool is active in a session.
+
 Install the asset before you open `scenes/pinmatch_test.hiplc` on another machine or from
 another checkout location. The .hip records the asset path of the machine it was saved on
 (issue #2).
@@ -71,7 +83,8 @@ hython tests/make_test_scene.py --no-render
 ## Workflow
 
 1. Create a **Camera Pin Matcher** node at `/obj`. On the **Setup** tab, set **Target Camera**,
-   **Reference Geometry** (an object; its display SOP is used) and **Plate Image**
+   **Reference Geometry** (an object; its display SOP is used: a mesh, a scan or a Gaussian
+   splat, see [Scans and Gaussian splats](#scans-and-gaussian-splats)) and **Plate Image**
    (`$F` sequences are supported, for example `$HIP/plate/plate.$F4.jpg`). If you want the
    camera resolution to match the plate, turn on **Match Camera Resolution to Plate**.
 2. Select the node, move the mouse over the viewport and press **Enter**, or click
@@ -109,12 +122,58 @@ hython tests/make_test_scene.py --no-render
   visible-object mask.
 * **2D pan/zoom:** the mouse wheel zooms around the cursor, the middle mouse button pans, and
   **H** resets. This is a pure viewport zoom; see [How the view lock works](#how-the-view-lock-works).
-* **Display modes (M or the Display tab):**
-  1. Plate in the background with the mesh as a wireframe on top.
-  2. Plate in the foreground at **Plate Opacity** (default 50 %) over a shaded mesh.
+* **Plate mode (M or the Display tab):** **Plate Behind Geometry**, or **Plate Over Geometry**
+  at **Plate Opacity** (default 50 %).
+* **Mesh display (W or the Display tab):**
+  * **Wireframe (All Edges)**: every edge, also the ones behind surfaces. Fine for simple models.
+  * **Hidden Line** (default): only the edges you would see on a solid model. The surface
+    itself is invisible, so the plate shows through it.
+  * **Hidden Line Ghost**: the same edges on a see-through shaded surface.
+  * **Shaded**: an opaque shaded surface with its visible edges.
+* **Wire Opacity** (default 0.7) and **Mesh Wire Color** set how strongly the edges are drawn.
+  On dense scans, try 0.2–0.4.
 
   Drawables draw the plate, the mesh, the pins and the HUD, so the tool's display doesn't
-  depend on the viewport's shading or display settings.
+  depend on the viewport's shading or display settings. Gaussian splats and point clouds are
+  the exception: Houdini's viewport draws them, and the tool draws the plate and the pins.
+
+## Scans and Gaussian splats
+
+**Dense meshes (scans)**
+
+* The tool prepares the reference once per cook of its display SOP, not once per frame, so
+  scrubbing over a static scan costs nothing. It unpacks packed primitives (Alembic, USD) and
+  converts polysoups to polygons for drawing; the object itself is not changed.
+* **Hidden Line** removes back faces and hidden edges. On very dense meshes the visible edges
+  still fill the image, so lower **Wire Opacity** or use **Hidden Line Ghost**.
+* Snapping: on a scan almost every pixel has a vertex, so **Points** snaps to the nearest
+  vertex, which is rarely a feature corner. **Free Surface Hit** takes the exact point under the
+  cursor. In the hidden-line and shaded displays, hidden vertices are never snapped to.
+* On the 1M-triangle test scan: about 0.2 s to set it as the reference, 0.15 s the first time a
+  shaded display is used, and 50 ms to create a pin.
+* The tool view has its own near clip, scaled to the reference's size and distance. A camera's
+  default near clip of 0.001 leaves too little depth precision for hidden line on distant
+  surfaces (it broke up at about 1 km in testing). The target camera's clip is not changed.
+
+**Gaussian splats**
+
+* Houdini 22 draws splats in the viewport from the point attributes `GS_Alpha`, `Cd`, `scale`
+  and `orient`. The **Bake GSplats** SOP makes these from a 3DGS `.ply` loaded with a File SOP.
+  A reference with `GS_Alpha` is recognised as splats (the HUD says *Gaussian splats*). A raw
+  `.ply` without Bake GSplats is treated as a point cloud, and the HUD suggests the SOP.
+* Houdini draws the splat, so it needs its display flag on. The tool doesn't hide it; it draws
+  the plate and the pins. **Plate Behind Geometry** shows the plate where the splat doesn't
+  cover it; **Plate Over Geometry** blends the plate over the splat.
+* Creating a pin: the tool composites the cursor ray front to back through the Gaussians, like
+  a splat renderer. Each Gaussian adds its peak opacity along the ray, and the anchor goes where
+  the ray becomes 50 % opaque, that is on the surface you see. Faint floaters in front don't
+  catch the pin.
+  * **Free Surface Hit** and **Edges**: that point, exactly under the cursor.
+  * **Points**: the centre of the nearest splat that contributes to what you see.
+  * A pick takes about 13 ms on 500k splats.
+* Plain point clouds (no splat attributes, for example LiDAR): each point counts as a small
+  round Gaussian of 2, 5 or 12 pixels, and the nearest surface that is dense enough at one of
+  these sizes wins.
 
 ## Hotkeys
 
@@ -132,7 +191,8 @@ them in the Hotkey Editor. On macOS, Houdini's **Ctrl** is the **⌘** key.
 | K | Solve & Key the current frame |
 | C | Copy pins from the nearest pinned (keyed) frame |
 | G | Show / hide ghost pins |
-| M | Switch the plate mode (background ↔ foreground) |
+| M | Switch the plate mode (behind ↔ over the geometry) |
+| W | Next mesh display: wireframe → hidden line → hidden line ghost → shaded |
 | Mouse wheel / MMB drag | 2D zoom / pan of the view |
 | H | Reset the 2D view |
 | RMB | Tool menu: all the actions above, locks and presets, snapping mode, bulk pin operations, keyed frames |
@@ -146,9 +206,11 @@ them in the Hotkey Editor. On macOS, Houdini's **Ctrl** is the **⌘** key.
 | | Plate Image | An image or `$F` sequence |
 | | Match Camera Resolution to Plate | Sets the camera `res` to the plate's resolution (when entering the tool or when the plate changes) |
 | | Enter Pin Matcher Tool | Makes the node current and enters the tool |
-| Display | Plate Mode | Background with wireframe, or foreground over the shaded mesh |
-| | Plate Opacity | Opacity of the plate in foreground mode (default 0.5) |
-| | Mesh Wire Color | Colour of the wireframe |
+| Display | Plate Mode | Plate Behind Geometry, or Plate Over Geometry |
+| | Plate Opacity | Opacity of the plate over the geometry (default 0.5) |
+| | Mesh Display | Wireframe (All Edges), Hidden Line (default), Hidden Line Ghost, Shaded |
+| | Wire Opacity | Opacity of the edges (default 0.7) |
+| | Mesh Wire Color | Colour of the edges |
 | | Show Ghost Pins | Pins of the previous / next pinned frame |
 | | Show Per-Pin Error | Adds the reprojection error in px to each label |
 | Pins | Snap New Pins To | Points (default), Edges, or Free Surface Hit |
@@ -187,6 +249,7 @@ The HUD shows:
 * the locked parameters, including protected ones
 * the focal length and horizontal FOV
 * the keyed frames
+* the reference: mesh (with its polygon count), Gaussian splats or point cloud
 
 ## Solver
 
@@ -259,7 +322,8 @@ hython tests/test_core.py
 ```
 
 Camera model against Houdini, ground-truth recovery, locks, 1- and 2-pin behaviour, guards,
-protected parameters, asset buttons, undo and resolution matching.
+protected parameters, asset buttons, undo, resolution matching, ray hits on Gaussian splats and
+point clouds, and the polygon conversion of packed and polysoup references.
 
 ```bash
 houdini -foreground tests/test_gui.py
@@ -277,7 +341,8 @@ Rebuilds the test scene and re-renders the plate with Karma. `--no-render` keeps
 The GUI test drives the live viewer state with mock UI events. Their rays come from the real
 viewport (`mapToWorld`), so it covers everything below raw OS input: picking, snapping, live
 solves, drawables, parameter writes, keys, undo and persistence. Synthetic Qt events don't reach
-Houdini's viewer-state dispatch. See `TESTLOG.md` for the results.
+Houdini's viewer-state dispatch. Hidden-line removal is checked on the rendered pixels of the
+viewport. See `TESTLOG.md` for the results.
 
 ## Known limitations
 
@@ -295,6 +360,12 @@ work and ideas; the numbers below refer to them.
   them (#9).
 * The solve uses only the pins of the current frame. There is no bundle adjustment across
   frames (#6) and no lens distortion (#5). One bad pin pulls the whole solve (#7).
+* Hidden line draws the edges slightly toward the camera so they stay on top of their own
+  faces. An edge less than about 0.2 % of its distance behind a surface can therefore still show.
+* Splat anchors are as accurate as the splat. Splats spill over object edges, and seen at a
+  grazing angle a splat surface is a few millimetres thick, so pin well-defined features on
+  surfaces that face the camera. The plate can't sit behind a semi-transparent splat: it is
+  either behind it where the splat doesn't cover, or blended over it.
 * **Lock Roll** is a stiff constraint on the camera's roll relative to world +Y. It holds to
   about 1e-8 rad but is not an exact elimination. It isn't defined for cameras looking straight
   up or down (#8).
@@ -317,6 +388,17 @@ behaviour differed from the docs or was unclear, this is what I found:
     the image size.
 * `hou.loadImageDataFromFile` returns **linearised** values, and image layers are displayed
   as-is, so the tool re-encodes them to sRGB. Pixel-array image sources render white.
+* `GeometryDrawable`s share one depth buffer with each other; `fade_factor` compares them with
+  the scene's depth instead:
+  * A Face drawable with alpha 0 writes depth but no colour, which is how hidden line works.
+  * There is no polygon offset: lines drawn on their own faces z-fight, so the tool pulls them
+    toward the eye (a scale about the eye leaves their image unchanged).
+  * Lines tested against the scene's depth with `fade_factor` 0 leak dashes where they should
+    be hidden.
+  * `setGeometry` refuses anything but polygons ("Advanced Drawables only support polygonal
+    geometry").
+* Gaussian splats in SOPs are points with `GS_Alpha` (both the flag and the opacity), `Cd`,
+  `scale` and `orient`. The viewport draws them and they write depth.
 * Drawable parameter types:
   * `falloff_range` needs a plain tuple, not a `hou.Vector2`.
   * `TextDrawable` `color1` renders crisp only as a `hou.Color`; 4-tuples come out dim.

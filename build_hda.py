@@ -53,12 +53,16 @@ def parm_templates():
         toggle("matchres", "Match Camera Resolution to Plate",
                help="Set the camera's resolution to the plate's (on enter and when the plate changes)."),
         button("enter", "Enter Pin Matcher Tool", "cb_enter"),
-    ] + [hou.FloatParmTemplate(n, n, 1, default_value=(v,), is_hidden=True)      # 2D pan/zoom of the tool view
-         for n, v in (("view_cx", 0.5), ("view_cy", 0.5), ("view_zoom", 1.0))]
+    ] + [hou.FloatParmTemplate(n, n, 1, default_value=(v,), is_hidden=True)      # tool view: 2D pan/zoom, near clip
+         for n, v in (("view_cx", 0.5), ("view_cy", 0.5), ("view_zoom", 1.0), ("view_near", 0.0))] + [
+        hou.StringParmTemplate("view_mask", "view_mask", 1, default_value=("",), is_hidden=True)]   # user's mask, see onEnter
     display = [
-        menu("platemode", "Plate Mode", ("bg", "fg"),
-             ("Plate Background, Wireframe Mesh", "Plate Foreground over Shaded Mesh")),
+        menu("platemode", "Plate Mode", ("bg", "fg"), ("Plate Behind Geometry", "Plate Over Geometry")),
         hou.FloatParmTemplate("opacity", "Plate Opacity", 1, default_value=(0.5,), min=0.0, max=1.0,
+                              min_is_strict=True, max_is_strict=True, help="Opacity of the plate over the geometry."),
+        menu("meshdisplay", "Mesh Display", ("wire", "hidden", "ghost", "shaded"),
+             ("Wireframe (All Edges)", "Hidden Line", "Hidden Line Ghost", "Shaded"), default=1),
+        hou.FloatParmTemplate("wireopacity", "Wire Opacity", 1, default_value=(0.7,), min=0.0, max=1.0,
                               min_is_strict=True, max_is_strict=True),
         hou.FloatParmTemplate("wirecolor", "Mesh Wire Color", 3, default_value=(0.3, 1.0, 0.5),
                               look=hou.parmLook.ColorSquare, naming_scheme=hou.parmNamingScheme.RGBA),
@@ -122,9 +126,10 @@ def add_view_proxy(sub):
     for a in "XYZ":
         cam.parm("t" + a.lower()).setExpression('origin("", %s, "T%s")' % (C, a))
         cam.parm("r" + a.lower()).setExpression('origin("", %s, "R%s")' % (C, a))
-    for parm, default in (("focal", 50), ("aperture", 41.4214), ("near", 0.001), ("far", 10000),
-                          ("resx", 1920), ("resy", 1080), ("aspect", 1)):
+    for parm, default in (("focal", 50), ("aperture", 41.4214), ("far", 10000), ("resx", 1920), ("resy", 1080),
+                          ("aspect", 1)):
         cam.parm(parm).setExpression(tgt(parm, default))
+    cam.parm("near").setExpression('max(%s, ch("../view_near"))' % tgt("near", 0.001))   # depth precision, see _fit_near
     for a in "xy":
         cam.parm("win" + a).setExpression('%s + %s * (ch("../view_c%s") - 0.5)' % (tgt("win" + a, 0), tgt("winsize" + a, 1), a))
         cam.parm("winsize" + a).setExpression('%s / ch("../view_zoom")' % tgt("winsize" + a, 1))
@@ -135,6 +140,7 @@ def build():
     hou.hipFile.clear(suppress_save_prompt=True)
     os.makedirs(os.path.dirname(HDA_PATH), exist_ok=True)
     if os.path.exists(HDA_PATH):
+        os.chmod(HDA_PATH, 0o644)        # it was left read-only (below); Windows can't delete it otherwise
         os.remove(HDA_PATH)
     sub = hou.node("/obj").createNode("subnet", "camera_pin_matcher")
     add_view_proxy(sub)
@@ -170,6 +176,7 @@ def build():
     d.addSection("Help", HELP)
     d.save(HDA_PATH, create_backup=False)
     shutil.rmtree(os.path.join(ROOT, "otls", "backup"), ignore_errors=True)   # Houdini's per-edit backups
+    os.chmod(HDA_PATH, 0o444)   # a build product: no Houdini session can save into it or delete the asset from it
     print("built", HDA_PATH)
 
 

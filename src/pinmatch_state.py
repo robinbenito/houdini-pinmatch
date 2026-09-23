@@ -22,6 +22,11 @@ SNAP_PX = 20.0          # point / edge snapping radius when creating pins
 ZOOM_RANGE = (0.25, 64.0)
 COLORS = {"active": (0.15, 1.0, 0.35), "inactive": (0.6, 0.6, 0.6), "locked": (1.0, 0.55, 0.1),
           "selected": (1.0, 0.95, 0.15), "ghost": (0.8, 0.4, 1.0)}
+DISPLAYS = (("wire", "Wireframe (All Edges)"), ("hidden", "Hidden Line"), ("ghost", "Hidden Line Ghost"),
+            ("shaded", "Shaded"))
+PULL = 1e-3             # wires / ghost faces are drawn this much (relative) nearer the eye than the depth faces
+GHOST_ALPHA = 0.35
+NEAR_FRACTION = 1e-3    # tool view near clip = this x (eye distance to the reference + its radius)
 R = hou.uiEventReason
 
 HUD = {
@@ -34,6 +39,7 @@ HUD = {
         {"id": "locks", "label": "Locked"},
         {"id": "lens", "label": "Focal / H-FOV"},
         {"id": "keys", "label": "Keyed frames"},
+        {"id": "ref", "label": "Reference"},
         {"type": "divider"},
         {"id": "k_create", "label": "Create pin on mesh", "key": "Ctrl + LMB"},
         {"label": "Select / drag pin", "key": "LMB"},
@@ -43,7 +49,7 @@ HUD = {
         {"label": "Copy pins from nearest keyed frame", "key": "C"},
         {"label": "2D pan / zoom", "key": "MMB / mousewheel"},
         {"label": "Reset 2D view", "key": "H"},
-        {"label": "Plate mode / ghosts", "key": "M / G"},
+        {"label": "Plate mode / mesh display / ghosts", "key": "M / W / G"},
     ]}
 
 # Hotkeyable menu actions: id -> (label, default key)
@@ -51,12 +57,35 @@ ACTIONS = {
     "toggle_active": ("Toggle Pin Active", "A"), "toggle_lock": ("Toggle Pin Lock", "L"),
     "solve_key": ("Solve & Key", "K"), "copy_nearest": ("Copy Pins from Nearest Keyed Frame", "C"),
     "reset_view": ("Reset 2D View", "H"), "toggle_mode": ("Toggle Plate Mode", "M"),
-    "toggle_ghosts": ("Show Ghost Pins", "G"),
+    "cycle_display": ("Cycle Mesh Display", "W"), "toggle_ghosts": ("Show Ghost Pins", "G"),
 }
 
 
 def _vec(v):
     return hou.Vector3(float(v[0]), float(v[1]), float(v[2]))
+
+
+def _pull(eye, a):
+    """Scale about the eye by 1 - a: points keep their image position but move a (relative) toward
+    the camera, so lines win the depth test against the faces they lie on (drawables have no
+    polygon offset)."""
+    k = 1.0 - a
+    return hou.Matrix4(((k, 0.0, 0.0, 0.0), (0.0, k, 0.0, 0.0), (0.0, 0.0, k, 0.0),
+                        (eye[0] * a, eye[1] * a, eye[2] * a, 1.0)))
+
+
+def _later(fn):
+    """Run fn when Houdini is idle; quietly skip it if the tool's node was deleted in the meantime."""
+    def run():
+        try:
+            fn()
+        except hou.ObjectWasDeleted:
+            pass
+    hdefereval.executeDeferred(run)
+
+
+def _count(n):
+    return "%.1fM" % (n / 1e6) if n >= 1e6 else "%dk" % round(n / 1e3) if n >= 1e4 else str(n)
 
 
 class State(object):
@@ -69,27 +98,38 @@ class State(object):
         self.selected = None      # selected pin id (UI only)
         self.saved = None         # viewport state to restore on exit
         self.hud_values = None
+        self.active = False       # between onEnter and onExit; deferred work checks it
+        self.watch_pending = False
         self.caches = {}
         self.last_press = (None, 0.0)   # (pixel, time) of the last LMB press, to drop a trailing 'Picked'
 
 
     # ---------------------------------------------------------------- lifecycle
     def onEnter(self, kwargs):
+        self.active = True
         self.node = kwargs["node"]
         self.pm = self.node.hdaModule()
         kwargs["state_flags"]["indirect_handle_drag"] = False     # MMB is ours (2D pan)
         self.vp = self.sv.curViewport()
         self._make_drawables()
-        settings = self.vp.settings()
+        # The viewport's visible-object mask before the tool hid anything. A session that never got to
+        # onExit (asset reinstalled while active, crash) left its exclusions in the viewport; keeping
+        # the original on the node stops the next session from taking those for the user's mask.
+        mask = self.node.parm("view_mask").eval() or self.vp.settings().visibleObjects()
+        ref = self.pm.reference_object(self.node)
+        if ref is not None:          # hidden by earlier versions that re-attached after exiting
+            mask = " ".join(t for t in mask.split() if t != "^" + ref.path()) or "*"
+        with hou.undos.disabler():
+            self.node.parm("view_mask").set(mask)
         self.saved = {"camera": self.vp.camera(), "linked": self.vp.isCameraLockedToView(),
-                      "view": self.vp.defaultCamera().stash(), "mask": settings.visibleObjects()}
+                      "view": self.vp.defaultCamera().stash(), "mask": mask}
         self._set_view(0.5, 0.5, 1.0)
         self._attach()
         self._vp_callback = self._on_viewport_event
         self.vp.addEventCallback(self._vp_callback)
         hud = json.loads(json.dumps(HUD))
-        hud["rows"][8]["key"] = {"ctrl": "Ctrl", "shift": "Shift", "ctrlshift": "Ctrl + Shift"}[
-            self.node.parm("createmod").evalAsString()] + " + LMB"
+        next(r for r in hud["rows"] if r.get("id") == "k_create")["key"] = {
+            "ctrl": "Ctrl", "shift": "Shift", "ctrlshift": "Ctrl + Shift"}[self.node.parm("createmod").evalAsString()] + " + LMB"
         self.sv.hudInfo(template=hud)
         cam = self.pm.target_camera(self.node)
         self.pm.match_resolution(self.node, cam)
@@ -97,17 +137,25 @@ class State(object):
         self._update_hud(force=True)
 
     def onExit(self, kwargs):
+        # Inactive first: this exit fires the viewport's CameraSwitched event itself, and a watchdog
+        # queued by it (or anything else deferred) must not re-attach the view after the tool is gone.
+        self.active = False
+        try:
+            self.vp.removeEventCallback(self._vp_callback)
+        except (hou.Error, AttributeError):
+            pass
         try:
             self._end_drag(commit=True)
             self._set_view(0.5, 0.5, 1.0)
         except hou.ObjectWasDeleted:                    # the matcher node was deleted
             pass
-        try:
-            self.vp.removeEventCallback(self._vp_callback)
-        except (hou.Error, AttributeError):
-            pass
         s = self.saved or {}
         self.vp.settings().setVisibleObjects(s.get("mask", "*"))
+        try:
+            with hou.undos.disabler():
+                self.node.parm("view_mask").set("")
+        except hou.ObjectWasDeleted:
+            pass
         try:
             prev = s.get("camera")
             if prev is not None and prev == self._proxy():        # entered while already in the tool view
@@ -134,11 +182,14 @@ class State(object):
         return self.node.node("view_proxy")
 
     def _attach(self):
-        """Look through the view proxy (= target camera + 2D window); never linked."""
+        """Look through the view proxy (= target camera + 2D window); never linked. A reference mesh
+        is hidden here because the tool draws it; point clouds and splats are left to the viewport."""
+        if not self.active:
+            return
         cam, proxy = self.pm.target_camera(self.node), self._proxy()
         mask = self.saved["mask"] if self.saved else "*"
-        ref = self.pm.reference_object(self.node)
-        self.vp.settings().setVisibleObjects(mask if ref is None else "%s ^%s" % (mask, ref.path()))
+        ref = self._ref()
+        self.vp.settings().setVisibleObjects("%s ^%s" % (mask, ref.path) if ref and ref.kind == "mesh" else mask)
         if cam is None or proxy is None:
             return
         if self.vp.camera() != proxy:
@@ -154,12 +205,15 @@ class State(object):
             self.vp.setCamera(proxy)
 
     def _watchdog(self):
+        self.watch_pending = False
         if self.pm.target_camera(self.node) is not None and self.vp.camera() != self._proxy():
             self._attach()
 
     def _on_viewport_event(self, **kwargs):
-        if kwargs.get("event_type") == hou.geometryViewportEvent.CameraSwitched:
-            hdefereval.executeDeferred(self._watchdog)   # never re-enter the viewport from its callback
+        # Our own setCamera calls (_sync_view, every live solve) fire this too: keep one check pending.
+        if kwargs.get("event_type") == hou.geometryViewportEvent.CameraSwitched and not self.watch_pending:
+            self.watch_pending = True
+            _later(self._watchdog)                       # never re-enter the viewport from its callback
 
     def _view(self):
         n = self.node
@@ -171,6 +225,22 @@ class State(object):
             for name, value in (("view_cx", cx), ("view_cy", cy), ("view_zoom", zoom)):
                 self.node.parm(name).set(value)
         self._sync_view()
+        self.affine = None              # the uv -> pixel map changed; re-measured on next use (view is in sync)
+
+    def _fit_near(self, fr, ref):
+        """Near clip of the tool view from the reference's distance and size. Cameras often keep a
+        near clip of 0.001, which leaves too little depth precision to draw far or large scans as
+        hidden line. Only the view proxy's clip changes, never the target camera's."""
+        c = np.array(ref.center * ref.obj.worldTransform())
+        want = NEAR_FRACTION * (np.linalg.norm(fr.W[3, :3] - c) + ref.radius)
+        have = self.node.parm("view_near").eval()
+        if not 0.5 < want / max(have, 1e-12) < 2.0:
+            _later(lambda: self._set_near(want))         # no scene edits while drawing
+
+    def _set_near(self, value):
+        with hou.undos.disabler():
+            self.node.parm("view_near").set(value)
+        self._sync_view()
 
     def _zoom_at(self, uv, factor):
         cx, cy, z = self._view()
@@ -180,12 +250,13 @@ class State(object):
 
     # ---------------------------------------------------------------- geometry helpers
     def _frame(self):
-        """Target camera snapshot: cam, rig, W (world matrix), f (focal), near/far drawing depths."""
+        """Target camera snapshot: cam, rig, W (world matrix), f (focal), near/far drawing depths
+        (inside the tool view's clip range, which is the proxy's)."""
         cam = self.pm.target_camera(self.node)
         if cam is None:
             return None
-        rig = self.pm.Rig(cam)
-        near, far = cam.parm("near").eval(), cam.parm("far").eval()
+        rig, proxy = self.pm.Rig(cam), self._proxy()
+        near, far = (cam if proxy is None else proxy).parm("near").eval(), cam.parm("far").eval()
         return types.SimpleNamespace(cam=cam, rig=rig, W=rig.world(rig.q), f=rig.q[6],
                                      near=near * 4.0, far=near + (far - near) * 0.5)
 
@@ -233,19 +304,89 @@ class State(object):
         i = int(np.argmin(d))
         return pins[i] if d[i] <= PICK_PX else None
 
-    def _hit_mesh(self, uv, fr, mouse_px):
-        """Anchor for a new pin under the cursor (world space), per the 'snap' parm, or None.
-
-        points: nearest mesh point within SNAP_PX in screen space - every point counts, as every
-                edge is visible in the wireframe display; hidden points only lose ties (+3 px).
-        edges:  closest point on the edges of the face under the cursor, if within SNAP_PX.
-        Otherwise (and in 'surface' mode) the first surface hit of the cursor ray.
-        """
+    def _ref(self):
+        """The reference object's display geometry, prepared once per SOP cook: `kind` is 'mesh'
+        (drawn by the tool; packed prims and polysoups converted to polygons), 'splat' (points with
+        Houdini's GSplat attributes) or 'points'; the last two are drawn by the viewport itself.
+        Picking data and the shaded copy are made on first use (_points, _shade)."""
         obj = self.pm.reference_object(self.node)
         if obj is None:
             return None
-        geo = obj.displayNode().geometry()
-        xf = obj.worldTransform()
+        sop = obj.displayNode()
+        geo = sop.geometry()
+        key = (sop.path(), sop.cookCount())
+        r = self.caches.get("ref")
+        if r is None or r.key != key:
+            cloud = geo.intrinsicValue("primitivecount") == 0
+            kind = "splat" if cloud and geo.findPointAttrib("GS_Alpha") is not None else "points"
+            if not cloud:
+                geo = self.pm.polygons(geo)
+                try:
+                    self.d_wire.setGeometry(geo)
+                    self.d_face.setGeometry(geo)
+                    kind = "mesh"
+                except hou.OperationFailed:      # nothing the drawables can show: viewport draws it, picked as points
+                    pass
+            bb = geo.boundingBox()
+            r = types.SimpleNamespace(key=key, path=obj.path(), kind=kind, geo=geo, center=bb.center(),
+                                      radius=0.5 * bb.sizevec().length(), P=None, sigma=None, alpha=None,
+                                      orient=None, shaded=False,
+                                      count=geo.intrinsicValue("primitivecount" if kind == "mesh" else "pointcount"),
+                                      raw_splat=cloud and kind == "points" and geo.findPointAttrib("opacity") is not None)
+            prev = self.caches.get("ref")
+            self.caches["ref"] = r
+            if prev is not None and (prev.path, prev.kind) != (r.path, r.kind):
+                _later(self._attach)                              # the viewport mask depends on the kind
+        r.obj = obj
+        return r
+
+    def _points(self, ref):
+        """Object-space picking data: P, plus sigma / alpha / orient for splats (float32 arrays)."""
+        if ref.P is None:
+            g = ref.geo
+            get = lambda name, n: np.frombuffer(g.pointFloatAttribValuesAsString(name), np.float32).reshape(-1, n)
+            ref.P = get("P", 3)
+            if ref.kind == "splat":
+                try:
+                    ref.sigma, ref.alpha, ref.orient = get("scale", 3), get("GS_Alpha", 1)[:, 0], get("orient", 4)
+                except (hou.OperationFailed, ValueError):         # incomplete GSplat attributes: plain points
+                    ref.sigma = ref.alpha = ref.orient = None
+        return ref.P
+
+    def _hit_cloud(self, ref, uv, fr):
+        """Pin anchor on Gaussian splats or a point cloud: the cursor ray is composited front to back
+        through the splats (pm.splat_hit). 'points' snaps to the splat centre nearest to where the ray
+        turns opaque; the other modes take that point on the ray itself."""
+        xf = ref.obj.worldTransform()
+        inv = xf.inverted()
+        o, d = self._ray(fr, uv)
+        o_l = np.array(o * inv)
+        d_l = np.array((o + d) * inv) - o_l
+        P = self._points(ref)
+        hit = self.pm.splat_hit(o_l, d_l, P, ref.sigma, ref.alpha, ref.orient,
+                                px=fr.rig.win[2] / (fr.rig.scales(fr.f)[0] * fr.rig.res[0]))
+        if hit is None:
+            return None
+        p = P[hit[1]] if self.node.parm("snap").evalAsString() == "points" else o_l + hit[0] * d_l
+        return tuple(_vec(p) * xf)
+
+    def _hit_mesh(self, uv, fr, mouse_px):
+        """Anchor for a new pin under the cursor (world space), per the 'snap' parm, or None.
+
+        points: nearest mesh point within SNAP_PX in screen space. In the wireframe display every
+                point counts, as every edge is visible, and hidden points only lose ties (+3 px);
+                in the hidden-line and shaded displays hidden points don't count.
+        edges:  closest point on the edges of the face under the cursor, if within SNAP_PX.
+        Otherwise (and in 'surface' mode) the first surface hit of the cursor ray.
+        Splats and point clouds: see _hit_cloud.
+        """
+        ref = self._ref()
+        if ref is None:
+            return None
+        if ref.kind != "mesh":
+            return self._hit_cloud(ref, uv, fr)
+        geo = ref.geo
+        xf = ref.obj.worldTransform()
         inv = xf.inverted()
         mode = self.node.parm("snap").evalAsString()
         o, d = self._ray(fr, uv)
@@ -261,17 +402,19 @@ class State(object):
 
         if mode == "points":
             M = self.pm._m(xf)
-            P = np.array(geo.pointFloatAttribValues("P")).reshape(-1, 3) @ M[:3, :3] + M[3, :3]
+            P = self._points(ref) @ M[:3, :3] + M[3, :3]
             dist = dist_px(P)
+            hidden_cost = 3.0 if self.node.parm("meshdisplay").evalAsString() == "wire" else np.inf
             best, best_rank = None, SNAP_PX
-            for i in np.argsort(dist)[:16]:
+            near = np.argpartition(dist, 16)[:16] if len(dist) > 16 else np.arange(len(dist))
+            for i in near[np.argsort(dist[near])]:
                 if dist[i] > best_rank:
                     break
                 ray = hou.Vector3(P[i]) * inv - o_l
                 h = hou.Vector3()
                 hidden = geo.intersect(o_l, ray.normalized(), h, hou.Vector3(), hou.Vector3()) >= 0 and \
                     (h - o_l).length() < ray.length() * (1 - 1e-5) - 1e-6
-                rank = dist[i] + (3.0 if hidden else 0.0)
+                rank = dist[i] + (hidden_cost if hidden else 0.0)
                 if rank <= best_rank:
                     best, best_rank = P[i], rank
             if best is not None:
@@ -496,6 +639,7 @@ class State(object):
             items.setdefault("lock_" + name, {})["value"] = bool(n.parm("lock_" + name).eval())
         states = kwargs["menu_states"]
         states.setdefault("plate_mode", {})["value"] = n.parm("platemode").evalAsString()
+        states.setdefault("mesh_display", {})["value"] = n.parm("meshdisplay").evalAsString()
         states.setdefault("snap_mode", {})["value"] = n.parm("snap").evalAsString()
 
     def onMenuAction(self, kwargs):
@@ -526,8 +670,10 @@ class State(object):
             self._set_view(0.5, 0.5, 1.0)
         elif item == "toggle_mode":
             n.parm("platemode").set(1 - n.parm("platemode").eval())
-        elif item in ("plate_mode", "snap_mode"):
-            n.parm("platemode" if item == "plate_mode" else "snap").set(kwargs[item])
+        elif item == "cycle_display":
+            n.parm("meshdisplay").set((n.parm("meshdisplay").eval() + 1) % len(DISPLAYS))
+        elif item in ("plate_mode", "mesh_display", "snap_mode"):
+            n.parm({"plate_mode": "platemode", "mesh_display": "meshdisplay", "snap_mode": "snap"}[item]).set(kwargs[item])
         elif item in ("toggle_ghosts", "toggle_errors"):
             p = n.parm("showghosts" if item == "toggle_ghosts" else "showerrors")
             p.set(1 - p.eval())
@@ -576,7 +722,7 @@ class State(object):
         vals = {"pins": "%d / %d" % (len(act), len(pins)) + ("   (C: copy from frame %d)" % src if src is not None else ""),
                 "frame": "%d%s" % (frame, "  (keyed)" if frame in keys else ""),
                 "keys": (", ".join(map(str, keys[:10])) + (" ..." if len(keys) > 10 else "")) or "none",
-                "status": "-", "rms": "-", "lens": "-", "locks": ", ".join(locks) or "none"}
+                "status": "-", "rms": "-", "lens": "-", "locks": ", ".join(locks) or "none", "ref": "-"}
         if cam is None:
             vals["status"] = "set a Target Camera"
             return vals
@@ -595,8 +741,14 @@ class State(object):
             vals["rms"] = "%.3f px" % info["rms"] if info["n"] else "-"
         else:
             vals["status"] = "no active pins"
-        if pm.reference_object(n) is None:
+        ref = self._ref()
+        if ref is None:
             vals["status"] += "  |  set Reference Geometry"
+        else:
+            vals["ref"] = "%s  (%s)" % (ref.path.rsplit("/", 1)[-1], {
+                "mesh": "mesh, %s polygons", "splat": "Gaussian splats, %s", "points": "point cloud, %s points"}[ref.kind] % _count(ref.count)) + (
+                "  - add a Bake GSplats SOP to see it as splats" if ref.raw_splat else "") + (
+                "  - display flag is off" if ref.kind != "mesh" and not ref.obj.isObjectDisplayed() else "")
         path = pm.plate_path(n)
         if not path or not os.path.isfile(path):
             vals["frame"] += "  (no plate)" if not path else "  (plate missing)"
@@ -674,64 +826,76 @@ class State(object):
             pt.setAttribValue(name, value)
         return g
 
-    def _mesh(self):
-        """Reference object; its wire / shaded drawables are rebuilt when the display SOP recooks
-        or the frame changes."""
-        obj = self.pm.reference_object(self.node)
-        if obj is None:
-            return None
-        sop = obj.displayNode()
-        key = (sop.path(), sop.cookCount(), hou.frame())
-        c = self.caches.get("mesh")
-        if c is None or c[0] != key:
-            geo = sop.geometry()
-            shaded = hou.Geometry()
-            hou.sopNodeTypeCategory().nodeVerb("normal").execute(shaded, [geo])
-            if shaded.findPointAttrib("N") or shaded.findVertexAttrib("N"):
-                cls = "Point" if shaded.findPointAttrib("N") else "Vertex"
-                N = np.array(getattr(shaded, "%sFloatAttribValues" % cls.lower())("N")).reshape(-1, 3)
-                light = np.array([0.35, 0.8, 0.5]) / np.linalg.norm([0.35, 0.8, 0.5])
-                shade = 0.3 + 0.7 * np.abs(N @ light)
-                cd = np.repeat(shade[:, None], 3, 1) * np.array([0.75, 0.78, 0.85])
-                shaded.addAttrib(getattr(hou.attribType, cls), "Cd", (1.0, 1.0, 1.0))
-                getattr(shaded, "set%sFloatAttribValues" % cls)("Cd", cd.ravel().tolist())
-            self.d_wire.setGeometry(geo)
-            self.d_face.setGeometry(shaded)
-            self.caches["mesh"] = (key, geo, shaded)
-        return obj
+    def _shade(self, ref):
+        """Give the face drawable a copy of the mesh with baked N.L shading in Cd (first use only)."""
+        if ref.shaded:
+            return
+        shaded = hou.Geometry()
+        hou.sopNodeTypeCategory().nodeVerb("normal").execute(shaded, [ref.geo])
+        cls = "Point" if shaded.findPointAttrib("N") else "Vertex" if shaded.findVertexAttrib("N") else None
+        if cls:
+            N = np.frombuffer(getattr(shaded, "%sFloatAttribValuesAsString" % cls.lower())("N"), np.float32).reshape(-1, 3)
+            light = np.array([0.35, 0.8, 0.5]) / np.linalg.norm([0.35, 0.8, 0.5])
+            cd = (0.3 + 0.7 * np.abs(N @ light))[:, None] * np.array([0.75, 0.78, 0.85])
+            shaded.addAttrib(getattr(hou.attribType, cls), "Cd", (1.0, 1.0, 1.0))
+            getattr(shaded, "set%sFloatAttribValuesFromString" % cls)("Cd", cd.astype(np.float32).tobytes())
+        self.d_face.setGeometry(shaded)
+        ref.shaded = True
+
+    def _draw_mesh(self, handle, fr, ref):
+        """The reference mesh in the 'meshdisplay' mode. The hidden-line modes first draw the faces
+        fully transparent: that writes the drawables' depth, so edges and ghost faces behind the
+        surface fail the depth test while the plate still shows through. Edges and ghost faces
+        are pulled toward the eye (_pull) to win against the faces they lie on."""
+        n = self.node
+        disp = n.parm("meshdisplay").evalAsString()
+        xf = ref.obj.worldTransform()
+        eye = fr.W[3, :3]
+        face = {"use_cd": False, "color1": (0.0, 0.0, 0.0, 0.0), "fade_factor": 1.0, "backface_culling": False}
+        if disp != "wire":
+            if disp != "hidden":
+                self._shade(ref)
+            self.d_face.setTransform(xf)
+            self.d_face.draw(handle, dict(face, use_cd=True, color1=(1.0, 1.0, 1.0, 1.0)) if disp == "shaded" else face)
+            if disp == "ghost":
+                self.d_face.setTransform(xf * _pull(eye, PULL))
+                self.d_face.draw(handle, dict(face, use_cd=True, color1=(1.0, 1.0, 1.0, GHOST_ALPHA)))
+        alpha = n.parm("wireopacity").eval()
+        if alpha > 0.0:
+            wc = n.parmTuple("wirecolor").eval()
+            self.d_wire.setTransform(xf if disp == "wire" else xf * _pull(eye, 2 * PULL))
+            self.d_wire.draw(handle, {"color1": (wc[0], wc[1], wc[2], alpha), "line_width": 1.5,
+                                      "fade_factor": 1.0, "use_cd": False})
 
     def onDraw(self, kwargs):
         handle = kwargs["draw_handle"]
-        n, pm = self.node, self.pm
+        n = self.node
         fr = self._frame()
         if fr is None:
             return
         view = self.pm._m(self.vp.viewTransform())
         if np.abs(view[:3, :3] - fr.W[:3, :3]).max() > 1e-6 or np.abs(view[3, :3] - fr.W[3, :3]).max() > 1e-6 * (
                 1.0 + np.abs(fr.W[3, :3]).max()):
-            hdefereval.executeDeferred(self._sync_view)      # view lags the camera (undo, script, time change)
-        self._measure_frame(fr)
+            _later(self._sync_view)                          # view lags the camera (undo, script, time change)
+        else:
+            self._measure_frame(fr)                          # only from a view in sync with the camera
         fg = n.parm("platemode").evalAsString() == "fg"
-        opacity = n.parm("opacity").eval()
+        ref = self._ref()
+        if ref is not None:
+            self._fit_near(fr, ref)
 
-        # reference mesh
-        obj = self._mesh()
-        if obj is not None:
-            xf = obj.worldTransform()
-            if fg:
-                self.d_face.setTransform(xf)
-                self.d_face.draw(handle, {"use_cd": True, "fade_factor": 1.0, "backface_culling": False})
-            else:
-                self.d_wire.setTransform(xf)
-                wc = n.parmTuple("wirecolor").eval()
-                self.d_wire.draw(handle, {"color1": hou.Vector4(wc[0], wc[1], wc[2], 1.0), "line_width": 1.5,
-                                          "fade_factor": 1.0, "use_cd": False})
-
-        # plate (background far away, or foreground right in front of the camera)
-        if self._plate():
-            depth = fr.near * 1.5 if fg else fr.far
-            self.d_plate.setGeometry(self._plate_geo(fr, depth, opacity if fg else 1.0))
-            self.d_plate.draw(handle, {"fade_factor": 1.0 if fg else 0.0})
+        # Plate behind: drawn first, far away (the reference's depth faces must not hide it). Plate in
+        # front: after the mesh, just in front of the camera. Splats and point clouds are drawn by
+        # the viewport, under the tool's drawables.
+        plate = self._plate()
+        if plate and not fg:
+            self.d_plate.setGeometry(self._plate_geo(fr, fr.far, 1.0))
+            self.d_plate.draw(handle, {"fade_factor": 0.0})
+        if ref is not None and ref.kind == "mesh":
+            self._draw_mesh(handle, fr, ref)
+        if plate and fg:
+            self.d_plate.setGeometry(self._plate_geo(fr, fr.near * 1.5, n.parm("opacity").eval()))
+            self.d_plate.draw(handle, {"fade_factor": 1.0})
 
         self._draw_pins(handle, fr)
         self._update_hud()
@@ -825,9 +989,15 @@ def _menu(state_name, definitions):
     m.addActionItem("keyed_frames", "Keyed Frames...")
     m.addSeparator()
     m.addRadioStrip("plate_mode", "Plate Mode", "bg")
-    m.addRadioStripItem("plate_mode", "bg", "Plate Background, Wireframe Mesh")
-    m.addRadioStripItem("plate_mode", "fg", "Plate Foreground over Shaded Mesh")
+    m.addRadioStripItem("plate_mode", "bg", "Plate Behind Geometry")
+    m.addRadioStripItem("plate_mode", "fg", "Plate Over Geometry")
     m.addActionItem("toggle_mode", "Toggle Plate Mode", hk["toggle_mode"])
+    display = hou.ViewerStateMenu("display_menu", "Mesh Display")
+    display.addRadioStrip("mesh_display", "Mesh Display", "hidden")
+    for k, lbl in DISPLAYS:
+        display.addRadioStripItem("mesh_display", k, lbl)
+    display.addActionItem("cycle_display", "Cycle Mesh Display", hk["cycle_display"])
+    m.addMenu(display)
     m.addToggleItem("toggle_ghosts", "Show Ghost Pins", True, hk["toggle_ghosts"])
     m.addToggleItem("toggle_errors", "Show Pin Errors", True)
     m.addActionItem("reset_view", "Reset 2D View", hk["reset_view"])

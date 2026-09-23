@@ -61,6 +61,32 @@ prior picks the smallest plausible camera change, so the focal is still far off,
 expected. From 4 pins on, the pins determine the camera. The residual error of 0.1–0.8 % focal
 comes from the injected 0.5 px click noise; the noise-free frame 12 solve is exact.
 
+## Reference display: scans and Gaussian splats (GUI)
+
+The test scene also has the room as a dense scan (`/obj/scan`: bilinear subdivision,
+triangulated, ±2 mm noise; 983 040 triangles) and as Gaussian splats (`/obj/splat`: 500 000
+flat splats on the surfaces with Houdini's GSplat attributes, plus 400 faint floaters). At frame
+20, with no pins on screen:
+
+| Check | Result |
+|---|---|
+| Hidden-line removal, on the rendered viewport pixels | 11 visible and 6 hidden room edges are all drawn in Wireframe (All Edges). In Hidden Line, Hidden Line Ghost and Shaded, all visible edges are drawn and none of the hidden ones |
+| Tool-view near clip | fitted to 0.0101 for the room (camera near clip stays 0.001) |
+| W hotkey | cycles hidden line → ghost → shaded → wireframe |
+| Dense scan: set as reference and first drawn | 0.26 s; first shaded draw (shading baked) 0.15 s; a redraw with framebuffer readback 21 ms |
+| Dense scan: Ctrl+click on a corner, Points snapping | pin on a vertex 8 mm from the corner (vertices there are 3–80 mm apart), 52 ms including pin creation |
+| Dense scan, Hidden Line: Ctrl+click on a hidden corner | snaps to a visible point, never to the hidden corner |
+| Splats: recognised by `GS_Alpha`, left to the viewport | yes, 500 400 splats, not in the visible-object mask |
+| Splats: Ctrl+click on 4 face centres, Free Surface Hit | within 0.2 mm of the true surface point |
+| Splats: the same, Points snapping | on a splat centre, within 2.7 cm |
+| Splat pick time | 13 ms for 500 400 splats |
+| Scan and splat objects unchanged | checksums equal |
+
+Hidden-line depth precision was also checked by hand with the room scaled ×100 (surfaces
+500–1000 m away): with the fitted near clip (0.5) the hidden-line display stays clean. Before
+the near clip was fitted (the camera's 0.001), a view of surfaces about 1 km away showed broken
+edges and hidden edges.
+
 ## Headless solver tests (`tests/test_core.py`)
 
 ```
@@ -75,7 +101,9 @@ GT 12 pins noise 0.5px: dpos 0.0056  drot 0.020 deg  dfocal 0.045%  rms 0.583px 
 GT 30 pins noise 0.5px: dpos 0.0028  drot 0.028 deg  dfocal 0.005%  rms 0.675px  over-constrained  2 it  5.3 ms
 hda: resolution matched, Solve & Key = 1 undo step, presets / copy / deactivate / delete buttons ok
 locks: locked values bit-identical, roll lock holds (1.9e-08 rad), focal clamped to 30.000
+polygons: packed and polysoup references are converted for the drawables
 protected parms: ['ry', 'tx'] treated as locked, look-at disables solving
+splats: depth error 0.0001 (splats) / 0.0045 (plain points), 2409000 splats picked in 70 ms
 OK
 ```
 
@@ -85,6 +113,11 @@ OK
 * **1 pin:** pan/tilt only. The camera moves 0.1 mm and the focal changes 0.06 %.
 * **2 pins:** pin A stays within 0.0004 px. With focal free the camera zooms; with focal
   locked it dollies (−0.38 along the view axis).
+* **Splats:** two walls of flat splats (5 m and 8 m away) with faint floaters in front. 30
+  rays hit the front wall within 0.1 mm, and the splat each one snaps to is on that wall. An
+  opaque floater on the ray is hit instead, as it should be. The same scene as a plain point
+  cloud (no splat attributes, 6 px point spacing) is hit within 4.5 mm. `_quat_matrices`
+  matches `hou.Quaternion`.
 * **Performance:** a 30-pin solve takes about 5 ms. In the GUI, a live drag event with 30 pins
   (solve plus camera parameter writes) takes about 2 ms, and a release with polish and keys about
   4 ms.
@@ -101,7 +134,7 @@ OK
 | Pins and keys survive save and reopen | PASS | GUI test saves, clears, reloads and compares the pin JSON and every keyframe |
 | 6 good pins recover focal within about 1 % and position within a small tolerance | PASS | 0.13 % and 1.7 cm with 0.5 px click noise; exact without noise |
 
-Other checks in the GUI test, all PASS (38 in total):
+Other checks in the GUI test, all PASS (50 in total):
 
 * Each create+drag and each drag is exactly one undo step, and one undo reverts pins and
   camera together.
@@ -114,6 +147,11 @@ Other checks in the GUI test, all PASS (38 in total):
 * Keys use `bezier()` and interpolate.
 * Delete keys works and is undoable.
 * Leaving the tool restores the viewport.
+* The reference display checks listed above.
+* Leaving the tool restores the camera and visible-object mask, also after the deferred work the
+  exit queued has run (an earlier version re-attached the view and hid the reference again).
+* Exclusions left behind by an earlier session are cleaned up, whether or not the node kept the
+  user's mask.
 
 ## Known gaps
 
