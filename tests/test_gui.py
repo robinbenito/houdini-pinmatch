@@ -200,12 +200,16 @@ def viewport_image(vp):
     return gl.grabFramebuffer(), gl.devicePixelRatioF(), h
 
 
-def magenta_near(shot, p, r=3):
-    """Number of pure-magenta (test wire colour) pixels within r px of viewport point p (origin bottom-left)."""
+def colors_near(shot, p, r=3):
+    """Pixel colours within r px of viewport point p (origin bottom-left)."""
     img, dpr, h = shot
     cx, cy, k = p[0] * dpr, (h - p[1]) * dpr, int(r * dpr)
-    return sum(c.red() > 190 and c.green() < 80 and c.blue() > 190
-               for c in (img.pixelColor(int(cx) + dx, int(cy) + dy) for dx in range(-k, k + 1) for dy in range(-k, k + 1)))
+    return [img.pixelColor(int(cx) + dx, int(cy) + dy) for dx in range(-k, k + 1) for dy in range(-k, k + 1)]
+
+
+def magenta_near(shot, p, r=3):
+    """Number of pure-magenta (test wire colour) pixels within r px of viewport point p."""
+    return sum(c.red() > 190 and c.green() < 80 and c.blue() > 190 for c in colors_near(shot, p, r))
 
 
 def edge_samples(pm, st, geo, clear_px=12.0):
@@ -436,6 +440,14 @@ def run():
     drv.menu("reset_view")
     check(node.parm("view_zoom").eval() == 1.0, "reset 2D view")
 
+    # --- HUD hints name the tool's hotkey symbols, which the HUD expands to the keys assigned now
+    mod = type(st).__init__.__globals__                   # the state's module (embedded in the asset)
+    actions = [a for row in mod["HUD"]["rows"] for a in row.get("actions", ())]
+    keys = dict(zip(actions, sv.hotkeyAssignments([mod["_hotkey"](st.state_name, a) for a in actions])))
+    log("hotkey assignments:", keys)
+    check(keys["toggle_active"] == ("A",) and keys["cycle_display"] == ("W",) and set(keys["delete_pin"]) == {"Del", "Backspace"}
+          and all(keys.values()), "HUD hint rows use the tool's hotkey symbols, all assigned")
+
     # --- pins, one at a time: Ctrl+drag from a mesh corner onto its plate feature (create + align in
     #     one gesture, as a user would). Pin 1 must stay put while pin 2 is dragged.
     n_undo = len(hou.undos.undoLabels())
@@ -489,6 +501,64 @@ def run():
     check(pm.keyed_frames(cam) == [1], "camera keyed at frame 1 only: %s" % pm.keyed_frames(cam))
     check(checksum(room) == room_sum, "reference mesh + network unchanged (checksum)")
     check(gt.asCode() == gt_sum, "other objects untouched")
+
+    # --- HUD evaluation: computed once, kept while nothing changes
+    st._hud_values()
+    cached = st.caches["eval"]
+    st._hud_values()
+    check(st.caches["eval"] is cached, "HUD solver status is cached between redraws")
+
+    # --- a 7th pin dragged onto the wrong plate feature: the robust solve keeps the camera, the pin is flagged
+    q6 = [cam.parm(p).eval() for p in pm.PARMS]
+    p7, target = next_corner(pm, room, cam, gt, used)
+    fr = st._frame()
+    a = st._screen(fr, fr.rig.project(fr.W, fr.f, p7[None])[0])[0]
+    drv.drag(a, st._screen(fr, [target])[0] + np.array([60.0, -45.0]), ctrl=True)
+    refresh()
+    pid = pm.pins_at(pm.load_pins(node))[-1]["id"]
+    dpos, drot, dfoc = cam_error(pm, cam, gt)
+    h = st._hud_values()
+    log("7th pin %d dragged 75 px past its plate feature: dpos %.4f drot %.3f deg dfocal %.3f%%, HUD outliers '%s'"
+        % (pid, dpos, drot, dfoc, h["outliers"]))
+    check(dfoc < 1.0 and dpos < 0.05 and drot < 0.3 and h["outliers"].startswith("%d (" % pid) and "," not in h["outliers"],
+          "a pin on the wrong plate feature is flagged and doesn't drag the camera")
+    # Drawn to the end (an exception in onDraw is silent): its red residual line, and its label, whose
+    # pixels change when the error is switched off. The pins are drawn last, so this covers all of onDraw.
+    fr = st._frame()
+    p7 = next(p for p in pm.pins_at(pm.load_pins(node)) if p["id"] == pid)
+    tgt, anc = st._screen(fr, [p7["uv"]])[0], st._screen(fr, fr.rig.project(fr.W, fr.f, np.array([p7["p"]]))[0])[0]
+    shots = []
+    with hou.undos.disabler():                           # keep the undo stack for the checks below
+        for show in (1, 0):
+            node.parm("showerrors").set(show)
+            refresh(st)
+            refresh(st)
+            shots.append(viewport_image(st.vp))
+        node.parm("showerrors").revertToDefaults()
+    red = sum(c.red() > 200 and c.green() < 100 and c.blue() < 100 for c in colors_near(shots[0], (tgt + anc) / 2))
+    label = sum(max(abs(a.red() - b.red()), abs(a.green() - b.green()), abs(a.blue() - b.blue())) > 60
+                for a, b in zip(colors_near(shots[0], tgt + [60, 15], 14), colors_near(shots[1], tgt + [60, 15], 14)))
+    check(red > 0 and label > 20, "the flagged pin is drawn red, residual line and error label included "
+                                  "(rendered pixels: %d red, %d label)" % (red, label))
+    drv.menu("deactivate_worst")
+    p7_now = next(p for p in pm.pins_at(pm.load_pins(node)) if p["id"] == pid)
+    check(not p7_now["on"] and st.selected == pid, "Deactivate Worst Pin deactivates and selects it")
+    hou.undos.performUndo()
+    hou.undos.performUndo()
+    check(len(pm.pins_at(pm.load_pins(node))) == 6 and np.allclose([cam.parm(p).eval() for p in pm.PARMS], q6),
+          "deactivating and the pin itself are undoable")
+
+    # --- Lock Roll is off, and the HUD says so, for a camera looking straight down
+    down = hou.node("/obj").createNode("cam", "look_down")
+    down.parmTuple("t").set((0.0, 6.0, 0.0))
+    down.parm("rx").set(-89.0)
+    node.parm("lock_roll").set(1)
+    node.parm("camera").set(down.path())
+    locks = st._hud_values()["locks"]
+    node.parm("camera").set(cam.path())
+    node.parm("lock_roll").set(0)
+    down.destroy()
+    check("roll (off: view within" in locks, "HUD: roll lock off for a view straight down (%r)" % locks)
 
     # --- undo of a drag restores pins and camera together
     before = [cam.parm(p).eval() for p in pm.PARMS], node.parm("pins").eval()

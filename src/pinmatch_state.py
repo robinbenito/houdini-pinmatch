@@ -7,6 +7,7 @@ Math, storage and camera IO live in the asset's PythonModule (node.hdaModule()).
 """
 import json
 import os
+import pickle
 import time
 import types
 
@@ -21,7 +22,7 @@ PICK_PX = 12.0          # pin grab radius
 SNAP_PX = 20.0          # point / edge snapping radius when creating pins
 ZOOM_RANGE = (0.25, 64.0)
 COLORS = {"active": (0.15, 1.0, 0.35), "inactive": (0.6, 0.6, 0.6), "locked": (1.0, 0.55, 0.1),
-          "selected": (1.0, 0.95, 0.15), "ghost": (0.8, 0.4, 1.0)}
+          "outlier": (1.0, 0.2, 0.2), "selected": (1.0, 0.95, 0.15), "ghost": (0.8, 0.4, 1.0)}
 DISPLAYS = (("wire", "Wireframe (All Edges)"), ("hidden", "Hidden Line"), ("ghost", "Hidden Line Ghost"),
             ("shaded", "Shaded"))
 PULL = 1e-3             # wires / ghost faces are drawn this much (relative) nearer the eye than the depth faces
@@ -36,6 +37,7 @@ HUD = {
         {"id": "frame", "label": "Frame"},
         {"id": "status", "label": "Solver"},
         {"id": "rms", "label": "RMS error"},
+        {"id": "outliers", "label": "Outlier pins"},
         {"id": "locks", "label": "Locked"},
         {"id": "lens", "label": "Focal / H-FOV"},
         {"id": "keys", "label": "Keyed frames"},
@@ -43,18 +45,20 @@ HUD = {
         {"type": "divider"},
         {"id": "k_create", "label": "Create pin on mesh", "key": "Ctrl + LMB"},
         {"label": "Select / drag pin", "key": "LMB"},
-        {"label": "Delete selected pin", "key": "del / backspace"},
-        {"label": "Toggle active / locked", "key": "A / L"},
-        {"label": "Solve & key", "key": "K"},
-        {"label": "Copy pins from nearest keyed frame", "key": "C"},
+        # "actions": hotkey actions; onEnter shows the keys assigned to them (Hotkey Editor), not the defaults
+        {"label": "Delete selected pin", "actions": ("delete_pin",)},
+        {"label": "Toggle active / locked", "actions": ("toggle_active", "toggle_lock")},
+        {"label": "Solve & key", "actions": ("solve_key",)},
+        {"label": "Copy pins from nearest keyed frame", "actions": ("copy_nearest",)},
         {"label": "2D pan / zoom", "key": "MMB / mousewheel"},
-        {"label": "Reset 2D view", "key": "H"},
-        {"label": "Plate mode / mesh display / ghosts", "key": "M / W / G"},
+        {"label": "Reset 2D view", "actions": ("reset_view",)},
+        {"label": "Plate mode / mesh display / ghosts", "actions": ("toggle_mode", "cycle_display", "toggle_ghosts")},
     ]}
 
-# Hotkeyable menu actions: id -> (label, default key)
+# Hotkeyable menu actions: id -> (label, default keys). Del / Backspace also reach onKeyEvent first.
 ACTIONS = {
     "toggle_active": ("Toggle Pin Active", "A"), "toggle_lock": ("Toggle Pin Lock", "L"),
+    "delete_pin": ("Delete Pin", ("Del", "Backspace")), "deactivate_worst": ("Deactivate Worst Pin", ()),
     "solve_key": ("Solve & Key", "K"), "copy_nearest": ("Copy Pins from Nearest Keyed Frame", "C"),
     "reset_view": ("Reset 2D View", "H"), "toggle_mode": ("Toggle Plate Mode", "M"),
     "cycle_display": ("Cycle Mesh Display", "W"), "toggle_ghosts": ("Show Ghost Pins", "G"),
@@ -72,6 +76,11 @@ def _pull(eye, a):
     k = 1.0 - a
     return hou.Matrix4(((k, 0.0, 0.0, 0.0), (0.0, k, 0.0, 0.0), (0.0, 0.0, k, 0.0),
                         (eye[0] * a, eye[1] * a, eye[2] * a, 1.0)))
+
+
+def _hotkey(state_name, action):
+    """The hotkey symbol su.defineHotkey gives a menu action."""
+    return "%s.%s" % (su.hotkeyContextForState(state_name, hou.objNodeTypeCategory()), action)
 
 
 def _later(fn):
@@ -128,9 +137,12 @@ class State(object):
         self._vp_callback = self._on_viewport_event
         self.vp.addEventCallback(self._vp_callback)
         hud = json.loads(json.dumps(HUD))
+        for row in hud["rows"]:
+            if "actions" in row:
+                row["key"] = su.hudModeHotkeyRefs([_hotkey(self.state_name, a) for a in row.pop("actions")])
         next(r for r in hud["rows"] if r.get("id") == "k_create")["key"] = {
             "ctrl": "Ctrl", "shift": "Shift", "ctrlshift": "Ctrl + Shift"}[self.node.parm("createmod").evalAsString()] + " + LMB"
-        self.sv.hudInfo(template=hud)
+        self.sv.hudInfo(template=hud, update_hotkey_bindings=True)
         cam = self.pm.target_camera(self.node)
         self.pm.match_resolution(self.node, cam)
         self._warn_camera(cam)
@@ -650,6 +662,13 @@ class State(object):
             self._with_selected("Toggle pin lock", lambda p, d: p.__setitem__("lock", not p["lock"]))
         elif item == "delete_pin":
             self._delete_selected()
+        elif item == "deactivate_worst":
+            info = self._evaluate(pm.target_camera(n), pm.pins_at(pm.load_pins(n)))
+            errors = [(e, i) for i, e in zip(info["pin_ids"], info["errors"]) if np.isfinite(e)] if info else []
+            if errors:
+                e, self.selected = max(errors)
+                self._with_selected("Deactivate worst pin", lambda p, d: p.__setitem__("on", False))
+                self.sv.setPromptMessage("%s: pin %d (%.1f px) deactivated - A turns it back on" % (LABEL, self.selected, e))
         elif item == "solve_key":
             info = pm.solve_and_key(n)
             self._sync_view()
@@ -707,7 +726,24 @@ class State(object):
         vals = self._hud_values()
         if force or vals != self.hud_values:
             self.hud_values = vals
-            self.sv.hudInfo(hud_values=vals)
+            self.sv.hudInfo(values=vals)
+
+    def _evaluate(self, cam, pins):
+        """The solver's view of the active pins at the camera as it is (a zero-iteration solve: status,
+        RMS, per-pin errors and outlier flags, plus pin_ids), or None if there is nothing to solve.
+        The HUD and the pin colours need it on every redraw, so it is kept until the pins, the camera
+        model or the solver settings change."""
+        pm = self.pm
+        act = [p for p in pins if p["on"]]
+        fatal, protected = pm.camera_problems(cam)
+        if fatal or not act:
+            return None
+        rig, free, opts = pm.Rig(cam), pm.free_mask(self.node, protected), pm.solver_options(self.node)
+        key = (json.dumps(act), pickle.dumps(vars(rig)), free, sorted(opts.items()))   # vars(rig): the whole camera model
+        if self.caches.get("eval", (None,))[0] != key:
+            _, info = pm.solve(rig, [p["p"] for p in act], [p["uv"] for p in act], free, rig.q, iters=0, **opts)
+            self.caches["eval"] = (key, dict(info, pin_ids=[p["id"] for p in act]))
+        return self.caches["eval"][1]
 
     def _hud_values(self):
         n, pm = self.node, self.pm
@@ -722,7 +758,7 @@ class State(object):
         vals = {"pins": "%d / %d" % (len(act), len(pins)) + ("   (C: copy from frame %d)" % src if src is not None else ""),
                 "frame": "%d%s" % (frame, "  (keyed)" if frame in keys else ""),
                 "keys": (", ".join(map(str, keys[:10])) + (" ..." if len(keys) > 10 else "")) or "none",
-                "status": "-", "rms": "-", "lens": "-", "locks": ", ".join(locks) or "none", "ref": "-"}
+                "status": "-", "rms": "-", "outliers": "-", "lens": "-", "locks": ", ".join(locks) or "none", "ref": "-"}
         if cam is None:
             vals["status"] = "set a Target Camera"
             return vals
@@ -735,10 +771,14 @@ class State(object):
         if fatal:
             vals["status"] = "disabled: " + fatal
         elif act:
-            _, info = pm.solve(rig, [p["p"] for p in act], [p["uv"] for p in act], pm.free_mask(n, protected),
-                               rig.q, iters=0, **pm.solver_options(n))
+            info = self._evaluate(cam, pins)
             vals["status"] = info["status"] + (" (%d behind camera)" % info["behind"] if info.get("behind") else "")
             vals["rms"] = "%.3f px" % info["rms"] if info["n"] else "-"
+            if info.get("redundant"):                   # enough pins to tell a bad one
+                bad = sorted(((e, i) for i, e, o in zip(info["pin_ids"], info["errors"], info["outliers"]) if o), reverse=True)
+                vals["outliers"] = ", ".join("%d (%.1f px)" % (i, e) for e, i in bad) or "none"
+            if info["roll_off"]:
+                vals["locks"] = vals["locks"].replace("roll", "roll (off: %s)" % info["roll_off"])
         else:
             vals["status"] = "no active pins"
         ref = self._ref()
@@ -933,10 +973,13 @@ class State(object):
             uv_a, z = rig.project(W, f, np.array([p["p"] for p in pins]))
             front = z > 0
             err = rig.pixel_errors(uv_a, uv_t)
-            state = ["inactive" if not p["on"] else "locked" if p["lock"] else "active" for p in pins]
+            info = self._evaluate(fr.cam, pins)
+            bad = {i for i, o in zip(info["pin_ids"], info["outliers"]) if o} if info else set()
+            state = ["inactive" if not p["on"] else "outlier" if p["id"] in bad else "locked" if p["lock"] else "active"
+                     for p in pins]
             T = rig.unproject(W, f, uv_t, depth)
             A = rig.unproject(W, f, uv_a[front], depth)
-            for key in ("inactive", "locked", "active"):
+            for key in ("inactive", "locked", "active", "outlier"):
                 self._markers(self.d_targets[key], T[[s_ == key for s_ in state]], COLORS[key], S.Locate, 15)
             sel = [p["id"] == self.selected for p in pins]
             self._markers(self.d_selected, T[sel], COLORS["selected"], S.Ring, 24)
@@ -945,15 +988,8 @@ class State(object):
             self.d_anchors.draw(handle, {"style": S.SmoothCircle, "radius": 6, "fade_factor": 1.0, "glow_width": 2,
                                          "highlight_mode": hou.drawableHighlightMode.MatteOverGlow,
                                          "color2": (0.0, 0.0, 0.0, 0.85)})
-            lg = hou.Geometry()
-            lg.addAttrib(hou.attribType.Point, "Cd", (1.0, 1.0, 1.0))
-            for t, a, c in zip(T[front], A, cols):
-                poly = lg.createPolygon(is_closed=False)
-                for q in (t, a):
-                    pt = lg.createPoint()
-                    pt.setPosition(_vec(q))
-                    pt.setAttribValue("Cd", c)
-                    poly.addVertex(pt)
+            lg = self._points_geo(np.stack([T[front], A], 1).reshape(-1, 3), np.repeat(cols, 2, axis=0))
+            lg.createPolygons([(i, i + 1) for i in range(0, 2 * len(A), 2)], False)   # open: target -> anchor (no keyword)
             self.d_lines.setGeometry(lg)
             self.d_lines.draw(handle, {"line_width": 2.0, "fade_factor": 1.0})
             for p, sc, e, st, fr_ in zip(pins, self._screen(fr, uv_t), err, state, front):
@@ -981,7 +1017,8 @@ def _menu(state_name, definitions):
     m = hou.ViewerStateMenu(state_name + "_menu", LABEL)
     m.addActionItem("toggle_active", "Toggle Pin Active", hk["toggle_active"])
     m.addActionItem("toggle_lock", "Toggle Pin Lock", hk["toggle_lock"])
-    m.addActionItem("delete_pin", "Delete Pin  (Del)")
+    m.addActionItem("delete_pin", "Delete Pin", hk["delete_pin"])
+    m.addActionItem("deactivate_worst", "Deactivate Worst Pin", hk["deactivate_worst"])
     m.addSeparator()
     m.addActionItem("solve_key", "Solve & Key", hk["solve_key"])
     m.addActionItem("copy_nearest", "Copy Pins from Nearest Keyed Frame", hk["copy_nearest"])

@@ -125,12 +125,57 @@ def test_locks():
         q, info = pm.solve(rig, P, uv, free, rig.q)
         assert all(q[i] == rig.q[i] for i in locked), (locked, q, rig.q)
         assert any(abs(q[i] - rig.q[i]) > 1e-6 for i in range(7) if free[i])
-    q, info = pm.solve(rig, P, uv, [True] * 7, rig.q, lock_roll=True)
-    roll0, roll1 = pm._roll(rig.world(rig.q)[:3, :3]), pm._roll(rig.world(q)[:3, :3])
-    assert abs(roll1 - roll0) < 1e-6, (roll0, roll1)
+    roll = lambda r, q: pm._roll(r.world(q)[:3, :3])
+    worst = 0.0
+    for locked in ([], [6], [0, 1, 2], [3], [4, 6]):              # exact with any mix of parm locks
+        q, info = pm.solve(rig, P, uv, [i not in locked for i in range(7)], rig.q, lock_roll=True, polish=2)
+        worst = max(worst, abs(roll(rig, q) - roll(rig, rig.q)))
+        assert info["roll_off"] is None and np.any(np.abs(q[3:6] - rig.q[3:6]) > 1e-3), (locked, q)
+    assert worst < 1e-12, worst
+    # Roll is undefined looking straight down: the lock is off within VERTICAL_DEG (and says so), exact outside.
+    for tilt, off in ((-88.0, True), (-80.0, False)):
+        rv = pm.Rig(make_cam("lv%d" % -tilt, t=(0.0, 12.0, 0.0), r=(tilt, 20.0, 0.0), focal=35.0, res=(1280, 720)))
+        Wv = rv.world(rv.q)
+        Pv = scene_points(8) @ Wv[:3, :3] + Wv[3, :3]
+        uvv = rv.project(Wv, rv.q[6], Pv)[0] + rng.uniform(-0.02, 0.02, (8, 2))
+        q, info = pm.solve(rv, Pv, uvv, [True] * 7, rv.q, lock_roll=True, polish=2)
+        assert (info["roll_off"] is not None) == off and (off or abs(roll(rv, q) - roll(rv, rv.q)) < 1e-12), (tilt, info)
     q, info = pm.solve(rig, P, uv * 0 + 0.5, [True] * 7, rig.q, focal_range=(30.0, 40.0))
     assert 30.0 - 1e-9 <= q[6] <= 40.0 + 1e-9
-    print("locks: locked values bit-identical, roll lock holds (%.1e rad), focal clamped to %.3f" % (abs(roll1 - roll0), q[6]))
+    print("locks: locked values bit-identical, roll lock exact (%.1e rad) and off within %g deg of vertical, "
+          "focal clamped to %.3f" % (worst, pm.VERTICAL_DEG, q[6]))
+
+
+def test_outlier():
+    """6 good pins and 1 on the wrong corner: the robust solve keeps the camera and flags that pin."""
+    r = np.random.default_rng(1)                         # own generator: same data when run alone
+    cam = make_cam("ol", t=(0.5, 1.6, 2.0), r=(-6.0, 10.0, 1.0), focal=32.0, aperture=36.0, res=(1920, 1080))
+    rig = pm.Rig(cam)
+    gt = rig.q.copy()
+    Wg = rig.world(gt)
+    P = np.c_[r.uniform(-3, 3, 7), r.uniform(-1.5, 2, 7), -r.uniform(3, 12, 7)] @ Wg[:3, :3] + Wg[3, :3]
+    uv = rig.project(Wg, gt[6], P)[0] + r.normal(0, 0.5, (7, 2)) / rig.res
+    uv[6] += np.array([70.0, -50.0]) / rig.res          # a neighbouring corner of the plate
+    start = gt + np.r_[r.uniform(-0.4, 0.4, 3), r.uniform(-4, 4, 3), 13.0]    # focal 45
+    res = {}
+    for robust in (False, True):
+        q, info = pm.solve(rig, P, uv, [True] * 7, start, polish=2, robust=robust)
+        W = rig.world(q)
+        res[robust] = (np.linalg.norm(W[3, :3] - Wg[3, :3]), abs(q[6] - gt[6]) / gt[6] * 100, info)
+    (dpos, dfoc, info), (dpos0, dfoc0, info0) = res[True], res[False]
+    qg, _ = pm.solve(rig, P[:6], uv[:6], [True] * 7, start, polish=2, robust=False)    # the good pins alone
+    qb, ib = pm.solve(rig, P[:6], uv[:6], [True] * 7, start, polish=2)
+    Wg6 = rig.world(qg)
+    print("outlier: least squares dpos %.4f dfocal %.2f%% flags %s | robust dpos %.4f dfocal %.3f%% flags %s | "
+          "6 good pins alone dpos %.4f dfocal %.3f%%" % (
+              dpos0, dfoc0, np.flatnonzero(info0["outliers"]), dpos, dfoc, np.flatnonzero(info["outliers"]),
+              np.linalg.norm(Wg6[3, :3] - Wg[3, :3]), abs(qg[6] - gt[6]) / gt[6] * 100))
+    assert dfoc0 > 2.0, "least squares should be dragged off, or this test proves nothing"
+    q = pm.solve(rig, P, uv, [True] * 7, start, polish=2)[0]
+    assert np.linalg.norm(rig.world(q)[3, :3] - Wg6[3, :3]) < 0.01 and abs(q[6] - qg[6]) / qg[6] < 0.002, \
+        "the wrong pin has next to no pull: as good as leaving it out"
+    assert dfoc < 2.0 and dpos < 0.1 and list(np.flatnonzero(info["outliers"])) == [6]
+    assert np.array_equal(qg, qb) and not ib["outliers"].any(), "pins that agree: robust = least squares"
 
 
 def test_few_pins():

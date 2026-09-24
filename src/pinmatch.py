@@ -14,6 +14,8 @@ import hou
 
 PARMS = ("tx", "ty", "tz", "rx", "ry", "rz", "focal")
 UNDO_PREFIX = "Camera Pin Matcher: "
+ROBUST_K, ROBUST_MIN_PX = 3.0, 2.0   # robust solve: pins within max(2 px, 3 x median error) count fully
+VERTICAL_DEG = 5.0                   # Lock Roll is off for views this close to straight up / down
 _CURVE_FUNCS = re.compile(r"^(bezier|linear|constant|cubic|qlinear|quintic|spline|ease|easein|easeout|"
                           r"easep|easeinp|easeoutp|match|matchin|matchout|vmatch|vmatchin|vmatchout)\(\)$")
 
@@ -178,35 +180,64 @@ def _composite(o, d, P, t, perp2, sigma, smax, alpha, orient, cutoff, need_opaqu
 # Solver
 # --------------------------------------------------------------------------------------------
 def solve(rig, P, UV, free, anchor, start=None, weight=1.0, lock_roll=False,
-          focal_range=(1.0, 5000.0), iters=40, polish=0):
+          focal_range=(1.0, 5000.0), iters=40, polish=0, robust=True):
     """Levenberg-Marquardt over the free subset of q (focal solved as log f).
 
     Minimises pixel reprojection error of the pins plus a small "minimal camera change" prior
     toward `anchor` (pixel-equivalent units, see PLAN.md). Pins behind the anchor camera are
     ignored; steps that push a used pin behind the camera are rejected.
+    `lock_roll` holds the anchor's roll about the view axis (relative to world +Y) exactly. Roll is
+    undefined for a view straight up or down: within VERTICAL_DEG of that the lock is off and
+    info["roll_off"] says why.
+    `robust`: once the pins are redundant (leave any one out and the rest still over-determine the
+    camera), a pin that disagrees with the others is down-weighted until it stops pulling (see
+    _solve). info["outliers"] flags pins with an error over twice the robust threshold.
     `polish` re-anchors the prior at the result and solves again (removes the prior's bias in
     directions the pins determine; used on commit, not while dragging).
     Returns (q, info) - q is `start`/`anchor` unchanged if nothing could be solved.
     """
+    anchor = np.asarray(anchor, float)
+    C = rig.world(anchor)[:3, :3]
+    rotates = bool(np.asarray(free, bool)[3:6].any())
+    vertical = abs(C[2, 1]) > math.cos(math.radians(VERTICAL_DEG))
+    roll = _roll(C) if lock_roll and rotates and not vertical else None    # decided once, polish included
+    q, info = _solve(rig, P, UV, free, anchor, start, weight, roll, focal_range, iters, robust)
+    for _ in range(polish):
+        q, info = _solve(rig, P, UV, free, q, q, weight, roll, focal_range, iters, robust)
+    info["roll_off"] = "view within %g deg of vertical" % VERTICAL_DEG if lock_roll and rotates and vertical else None
+    return q, info
+
+
+def _solve(rig, P, UV, free, anchor, start, weight, roll, focal_range, iters, robust):
+    """One pass of solve(). `roll`: the roll angle to hold, or None.
+
+    The roll constraint is exact: steps are taken in its tangent space and projected back onto it.
+    Robust weights are 1 for pins within c = max(ROBUST_MIN_PX, ROBUST_K * median error) and (c/e)^2
+    beyond: plain least squares while the pins agree, and a pin far off stops pulling (a Cauchy-like
+    tail; Huber isn't enough with few pins). That loss is not convex, so the IRLS starts from the fit
+    without the pin whose removal lowers the cost most: with few pins, least squares spreads a bad
+    pin's error over all of them, the leave-one-out statistic doesn't.
+    """
     P = np.asarray(P, float).reshape(-1, 3)
     UV = np.asarray(UV, float).reshape(-1, 2)
-    anchor = np.asarray(anchor, float)
     base = np.array(anchor if start is None else start, float)
     free = np.asarray(free, bool)
     idx = np.flatnonzero(free)
-    lock_roll = bool(lock_roll) and bool(free[3:6].any())
-    dof = len(idx) - int(lock_roll)
+    rot = np.flatnonzero((idx >= 3) & (idx < 6))         # rx, ry, rz among the variables
+    dof = len(idx) - int(roll is not None)
 
     Wa = rig.world(anchor)
     Ca, ca = Wa[:3, :3].copy(), Wa[3, :3].copy()
     _, za = rig.project(Wa, anchor[6], P)
     use = za > 1e-9
-    info = {"n": int(use.sum()), "behind": int((~use).sum()), "dof": dof, "iterations": 0}
+    info = {"n": int(use.sum()), "behind": int((~use).sum()), "dof": dof, "iterations": 0,
+            "outliers": np.zeros(len(P), bool)}
     if not use.any() or not len(idx):
         info.update(status="no active pins" if not len(P) else ("all parameters locked" if not len(idx)
                     else "pins behind camera"), rms=0.0, errors=np.zeros(len(P)), rank=0)
         return base, info
     Pu, UVu = P[use], UV[use]
+    redundant = 2 * (len(Pu) - 1) > dof
 
     F = anchor[6] / rig.aperture * rig.res[0]           # focal length in pixels
     R = 0.5 * math.hypot(*rig.res)                      # half image diagonal in pixels
@@ -215,7 +246,6 @@ def solve(rig, P, UV, free, anchor, start=None, weight=1.0, lock_roll=False,
     w_rot = lam * np.array([F, F, 8 * R])               # tilt, pan, roll
     w_zoom = lam * 8 * R
     w_move = lam * np.array([120 * F, 120 * F, 40 * R]) / D   # truck, pedestal, dolly
-    roll_a = _roll(Ca)
     lo, hi = math.log(focal_range[0]), math.log(focal_range[1])
 
     def to_q(x):
@@ -230,24 +260,56 @@ def solve(rig, P, UV, free, anchor, start=None, weight=1.0, lock_roll=False,
             x[-1] = min(max(x[-1], lo), hi)
         return x
 
-    def residual(x):
+    def residual(x, sw):
+        """Pin errors in px (times the square roots of the pin weights `sw`) + prior; depths."""
         q = to_q(x)
         W = rig.world(q)
         uv, z = rig.project(W, q[6], Pu)
-        C = W[:3, :3]
-        Q = C @ Ca.T                                     # rotation relative to the anchor camera
-        w = 0.5 * np.array([Q[1, 2] - Q[2, 1], Q[2, 0] - Q[0, 2], Q[0, 1] - Q[1, 0]])
+        Q = W[:3, :3] @ Ca.T                             # rotation relative to the anchor camera
+        om = 0.5 * np.array([Q[1, 2] - Q[2, 1], Q[2, 0] - Q[0, 2], Q[0, 1] - Q[1, 0]])
         d = (W[3, :3] - ca) @ Ca.T                       # translation in anchor camera axes
-        parts = [((uv - UVu) * rig.res).ravel(), w_rot * w, [w_zoom * math.log(q[6] / anchor[6])], w_move * d]
-        if lock_roll:
-            parts.append([1e3 * R * math.remainder(_roll(C) - roll_a, 2 * math.pi)])
-        return np.concatenate(parts), z
+        return np.concatenate([((uv - UVu) * rig.res * sw[:, None]).ravel(), w_rot * om,
+                               [w_zoom * math.log(q[6] / anchor[6])], w_move * d]), z
+
+    def pin_errors(x):
+        q = to_q(x)
+        return rig.pixel_errors(rig.project(rig.world(q), q[6], Pu)[0], UVu)
+
+    def weights(x):
+        e = pin_errors(x)
+        return np.minimum(1.0, (max(ROBUST_MIN_PX, ROBUST_K * np.median(e)) / np.maximum(e, 1e-12)) ** 2)
+
+    def roll_error(x):
+        return math.remainder(_roll(rig.world(to_q(x))[:3, :3]) - roll, 2 * math.pi)
+
+    def roll_grad(x, g):
+        a = np.zeros(len(x))                             # only the rotation variables change the roll
+        for k in rot:
+            xk = x.copy()
+            xk[k] += 1e-6
+            a[k] = (roll_error(xk) - g) / 1e-6
+        return a
+
+    def on_roll(x):
+        """x moved back onto the held roll (Newton along the roll gradient), or None."""
+        for _ in range(8):
+            g = roll_error(x)
+            if abs(g) < 1e-14:
+                return x
+            a = roll_grad(x, g)
+            if a @ a < 1e-24:
+                return None
+            x = x - a * (g / (a @ a))
+        return None
 
     x = base[idx].copy()
     if free[6]:
         x[-1] = math.log(base[6])
     x = clip(x)
-    r, z = residual(x)
+    xr = on_roll(x) if roll is not None else None
+    x = x if xr is None else xr
+    ones = np.ones(len(Pu))
+    r, z = residual(x, ones)
     if not np.all(np.isfinite(r)):
         info.update(status="invalid camera", rms=0.0, errors=np.zeros(len(P)), rank=0)
         return base, info
@@ -255,50 +317,94 @@ def solve(rig, P, UV, free, anchor, start=None, weight=1.0, lock_roll=False,
     zmin = 1e-6 * D
     steps = np.array([1e-6 * D] * 3 + [1e-5] * 3 + [1e-7])[idx]
 
-    def jacobian(x, r):
+    def jacobian(x, r, sw):
         J = np.empty((len(r), len(x)))
         for j in range(len(x)):
             xj = x.copy()
             xj[j] += steps[j]
-            J[:, j] = (residual(xj)[0] - r) / steps[j]
+            J[:, j] = (residual(xj, sw)[0] - r) / steps[j]
         return J
 
-    cost, mu = r @ r, 1e-3
-    for it in range(iters):
-        J = jacobian(x, r)
-        A, g = J.T @ J, J.T @ r
-        damp = np.diag(A) + 1e-12
-        while mu < 1e12:
-            dx = -np.linalg.solve(A + mu * np.diag(damp), g)
-            xn = clip(x + dx)
-            rn, zn = residual(xn)
-            cn = rn @ rn
-            if np.all(np.isfinite(rn)) and not np.any(front & (zn <= zmin)) and cn < cost:
+    def roll_basis(x, scale=1.0):
+        """Orthonormal basis (columns) of the steps that keep the held roll to first order, or None."""
+        if roll is None:
+            return None
+        a = roll_grad(x, roll_error(x)) / scale
+        return np.linalg.svd(a[None])[2][1:].T if a @ a > 1e-24 else None     # the null space of a
+
+    def lm(x, w=None, reweight=False):
+        """LM from x with pin weights w (default 1); `reweight` re-evaluates weights(x) after every step."""
+        w = weights(x) if reweight else ones if w is None else w
+        r = residual(x, np.sqrt(w))[0]
+        cost, mu = r @ r, 1e-3
+        for _ in range(iters):
+            J, N = jacobian(x, r, np.sqrt(w)), roll_basis(x)
+            if N is not None:
+                J = J @ N                                # steps that keep the roll
+            A, g = J.T @ J, J.T @ r
+            damp = np.diag(A) + 1e-12
+            while mu < 1e12:
+                dx = -np.linalg.solve(A + mu * np.diag(damp), g)
+                xn = clip(x + (dx if N is None else N @ dx))
+                if roll is not None:
+                    xn = on_roll(xn)
+                if xn is not None:
+                    rn, zn = residual(xn, np.sqrt(w))
+                    cn = rn @ rn
+                    if np.all(np.isfinite(rn)) and not np.any(front & (zn <= zmin)) and cn < cost:
+                        break
+                mu *= 4.0
+            else:
                 break
-            mu *= 4.0
-        else:
-            break
-        info["iterations"] = it + 1
-        done = cost - cn < 1e-12 * (1.0 + cost) or np.max(np.abs(xn - x)) < 1e-12
-        x, r, z, cost, mu = xn, rn, zn, cn, max(mu / 3.0, 1e-9)
-        if done:
-            break
+            info["iterations"] += 1
+            done = cost - cn < 1e-12 * (1.0 + cost) or np.max(np.abs(xn - x)) < 1e-12
+            x, r, cost, mu = xn, rn, cn, max(mu / 3.0, 1e-9)
+            wn = weights(x) if reweight else w
+            if np.max(np.abs(wn - w)) > 1e-3:           # IRLS: weights moved, carry on with the new ones
+                w = wn
+                r = residual(x, np.sqrt(w))[0]
+                cost = r @ r
+            elif done:
+                break
+        return x
+
+    def most_influential(x):
+        """The pin whose removal lowers the cost most, linearised: max e_k^T (I - H_kk)^-1 e_k."""
+        r = residual(x, ones)[0]
+        J, N = jacobian(x, r, ones), roll_basis(x)
+        J = J if N is None else J @ N
+        m = len(Pu)
+        Jp = J[:2 * m].reshape(m, 2, -1)
+        H = Jp @ np.linalg.pinv(J.T @ J) @ Jp.transpose(0, 2, 1)     # 2x2 diagonal blocks of the hat matrix
+        e = r[:2 * m].reshape(m, 2, 1)
+        return int(np.argmax((e.transpose(0, 2, 1) @ np.linalg.pinv(np.eye(2) - H) @ e).ravel()))
+
+    # Least squares first: weights taken at the start camera would reject a pin the camera has yet to
+    # move to (the pin being dragged).
+    x = lm(x)
+    if robust and redundant and iters and pin_errors(x).max() > ROBUST_MIN_PX:     # else nothing to down-weight
+        w = ones.copy()
+        w[most_influential(x)] = 0.0
+        x = lm(lm(x, w), reweight=True)
 
     q = to_q(x)
     uv, _ = rig.project(rig.world(q), q[6], P)
     err = rig.pixel_errors(uv, UV)
     err[~use] = np.nan
     # Numerical rank of the data Jacobian (at the result) with columns in pixel-equivalent units.
-    J = jacobian(x, r)
+    J = jacobian(x, residual(x, ones)[0], ones)
     nd = 2 * len(Pu)
     colscale = np.linalg.norm(J[nd:nd + 7], axis=0) / lam + 1e-12
-    sv = np.linalg.svd(J[:nd] / colscale, compute_uv=False)
+    Jd = J[:nd] / colscale
+    N = roll_basis(x, colscale)                          # the roll constraint in the scaled variables
+    sv = np.linalg.svd(Jd if N is None else Jd @ N, compute_uv=False)
     rank = int(np.sum(sv > 1e-4 * max(sv.max(), 1e-12)))
     status = ("under-constrained" if rank < dof or nd < dof else
               "solved" if nd == dof else "over-constrained")
-    info.update(status=status, rank=rank, errors=err, rms=float(np.sqrt(np.mean(err[use] ** 2))))
-    if polish > 0:
-        return solve(rig, P, UV, free, q, q, weight, lock_roll, focal_range, iters, polish - 1)
+    if redundant:                                        # robust weight under 1/4
+        e = err[use]
+        info["outliers"][use] = e > 2 * max(ROBUST_MIN_PX, ROBUST_K * np.median(e))
+    info.update(status=status, rank=rank, errors=err, rms=float(np.sqrt(np.mean(err[use] ** 2))), redundant=redundant)
     return q, info
 
 
@@ -408,7 +514,7 @@ def free_mask(node, protected=()):
 
 def solver_options(node):
     return {"weight": node.parm("minchange").eval(), "lock_roll": bool(node.parm("lock_roll").eval()),
-            "focal_range": tuple(node.parmTuple("focalrange").eval())}
+            "focal_range": tuple(node.parmTuple("focalrange").eval()), "robust": bool(node.parm("robust").eval())}
 
 
 def write_camera(cam, q, free):
