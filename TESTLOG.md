@@ -34,22 +34,22 @@ visible in the plate and spread across the image.
 
 | pins | status | position error | rotation error | focal error | RMS |
 |---|---|---|---|---|---|
-| 3 | under-constrained | 1.3839 | 1.611° | 20.034 % | 0.000 px |
-| 4 | over-constrained | 0.0326 | 0.146° | 0.409 % | 0.285 px |
-| 5 | over-constrained | 0.0587 | 0.181° | 0.792 % | 0.470 px |
-| **6** | **over-constrained** | **0.0173** | **0.171°** | **0.129 %** | 0.485 px |
+| 3 | under-constrained | 1.3641 | 1.549° | 19.754 % | 0.000 px |
+| 4 | over-constrained | 0.0206 | 0.094° | 0.258 % | 0.187 px |
+| 5 | over-constrained | 0.0378 | 0.117° | 0.510 % | 0.306 px |
+| **6** | **over-constrained** | **0.0107** | **0.110°** | **0.069 %** | 0.316 px |
 
 **Frame 1: solved vs. ground truth** after 6 pins and Solve & Key:
 
 | parm | ground truth | solved | start |
 |---|---|---|---|
-| tx | 1.4000 | 1.3952 | 2.2000 |
-| ty | 1.6500 | 1.6342 | 1.3000 |
-| tz | 3.6000 | 3.5948 | 4.4000 |
-| rx | −9.0000 | −8.8531 | −4.0000 |
-| ry | 14.0000 | 13.9914 | 24.0000 |
-| rz | 0.0000 | 0.1287 | −3.0000 |
-| focal | 30.0000 | **29.9613** (−0.13 %) | 42.0000 |
+| tx | 1.4000 | 1.3972 | 2.2000 |
+| ty | 1.6500 | 1.6400 | 1.3000 |
+| tz | 3.6000 | 3.5976 | 4.4000 |
+| rx | −9.0000 | −8.9052 | −4.0000 |
+| ry | 14.0000 | 13.9953 | 24.0000 |
+| rz | 0.0000 | 0.0834 | −3.0000 |
+| focal | 30.0000 | **29.9792** (−0.07 %) | 42.0000 |
 
 **Frame 12: rough matchmove.** The six pins were copied from frame 1 with **C**, dragged onto
 the frame-12 plate positions without noise, then solved with Solve & Key. Position, rotation and
@@ -58,8 +58,20 @@ between.
 
 With 3 pins the problem is under-constrained: 6 equations for 7 unknowns. The minimal-change
 prior picks the smallest plausible camera change, so the focal is still far off, which is
-expected. From 4 pins on, the pins determine the camera. The residual error of 0.1–0.8 % focal
+expected. From 4 pins on, the pins determine the camera. The residual error of 0.07–0.5 % focal
 comes from the injected 0.5 px click noise; the noise-free frame 12 solve is exact.
+
+**Frame 1: a 7th pin on the wrong plate feature** (Robust Solve, the default). After the six pins
+above, the test Ctrl+drags a 7th corner 75 px past its plate position:
+
+| | position error | rotation error | focal error |
+|---|---|---|---|
+| 6 good pins | 0.0107 | 0.110° | 0.069 % |
+| 6 good pins + the wrong one | 0.0097 | 0.110° | 0.026 % |
+
+The HUD lists it as the only outlier, `7 (55.3 px)` (its anchor snapped to a mesh point near the
+corner). It is drawn red, residual line and label included, which the test checks on the
+rendered pixels. **Deactivate Worst Pin** picks it, and both steps are undoable.
 
 ## Reference display: scans and Gaussian splats (GUI)
 
@@ -95,15 +107,16 @@ cheirality: min depth 0.031, focal 5.00, status over-constrained
 1 pin : err 0.0000 px, camera moved 0.00011, focal 30.000 -> 29.981, rot change [ 3.001  5.601 -0.345]  [under-constrained]
 2 pins focal free  : pinA err 0.0004 px, pinB err 0.0004 px, focal 33.35, move (x,y,z) [ 0.0017  0.0012 -0.0202]  [under-constrained]
 2 pins focal locked: pinA err 0.0058 px, pinB err 0.0057 px, focal 30.00, move (x,y,z) [ 0.0266  0.0075 -0.3775]  [under-constrained]
-GT  6 pins noise 0.0px: dpos 0.0000  drot 0.000 deg  dfocal 0.000%  rms 0.000px  over-constrained  3 it  5.6 ms
-GT  6 pins noise 0.5px: dpos 0.0075  drot 0.032 deg  dfocal 0.066%  rms 0.453px  over-constrained  3 it  5.1 ms
-GT 12 pins noise 0.5px: dpos 0.0056  drot 0.020 deg  dfocal 0.045%  rms 0.583px  over-constrained  2 it  5.9 ms
-GT 30 pins noise 0.5px: dpos 0.0028  drot 0.028 deg  dfocal 0.005%  rms 0.675px  over-constrained  2 it  5.3 ms
+GT  6 pins noise 0.0px: dpos 0.0000  drot 0.000 deg  dfocal 0.000%  rms 0.000px  over-constrained  3 it  5.8 ms
+GT  6 pins noise 0.5px: dpos 0.0075  drot 0.032 deg  dfocal 0.066%  rms 0.453px  over-constrained  3 it  5.6 ms
+GT 12 pins noise 0.5px: dpos 0.0056  drot 0.020 deg  dfocal 0.045%  rms 0.583px  over-constrained  2 it  6.1 ms
+GT 30 pins noise 0.5px: dpos 0.0028  drot 0.028 deg  dfocal 0.005%  rms 0.675px  over-constrained  2 it  5.7 ms
 hda: resolution matched, Solve & Key = 1 undo step, presets / copy / deactivate / delete buttons ok
-locks: locked values bit-identical, roll lock holds (1.9e-08 rad), focal clamped to 30.000
+locks: locked values bit-identical, roll lock exact (1.3e-15 rad) and off within 5 deg of vertical, focal clamped to 30.000
+outlier: least squares dpos 1.1541 dfocal 19.69% flags [] | robust dpos 0.0545 dfocal 1.047% flags [6] | 6 good pins alone dpos 0.0564 dfocal 1.115%
 polygons: packed and polysoup references are converted for the drawables
 protected parms: ['ry', 'tx'] treated as locked, look-at disables solving
-splats: depth error 0.0001 (splats) / 0.0045 (plain points), 2409000 splats picked in 70 ms
+splats: depth error 0.0001 (splats) / 0.0052 (plain points), 2409000 splats picked in 69 ms
 OK
 ```
 
@@ -113,6 +126,13 @@ OK
 * **1 pin:** pan/tilt only. The camera moves 0.1 mm and the focal changes 0.06 %.
 * **2 pins:** pin A stays within 0.0004 px. With focal free the camera zooms; with focal
   locked it dollies (−0.38 along the view axis).
+* **Lock Roll:** exact to 1.3e-15 rad with nothing locked, focal locked, position locked, RX
+  locked, and RY and focal locked, and the rotation still changes in each case. Looking 88° down
+  the lock is off and says so; looking 80° down it holds exactly.
+* **Outlier:** 6 good pins (0.5 px noise) and 1 pin 86 px off. Least squares ends 19.7 % off in
+  focal and flags nothing. The robust solve flags only the wrong pin and lands within 0.2 % focal
+  and 1 cm of what the 6 good pins give alone. On pins that agree, it gives the least-squares
+  camera bit for bit.
 * **Splats:** two walls of flat splats (5 m and 8 m away) with faint floaters in front. 30
   rays hit the front wall within 0.1 mm, and the splat each one snaps to is on that wall. An
   opaque floater on the ray is hit instead, as it should be. The same scene as a plain point
@@ -120,7 +140,50 @@ OK
   matches `hou.Quaternion`.
 * **Performance:** a 30-pin solve takes about 5 ms. In the GUI, a live drag event with 30 pins
   (solve plus camera parameter writes) takes about 2 ms, and a release with polish and keys about
-  4 ms.
+  4 ms. When the robust solve has a pin to down-weight: 5–10 ms per drag event (7 to 100 pins)
+  and 16–20 ms for the solve on release.
+
+## Robust solve: random trials
+
+Random scenes (`scene_points`), 0.5 px noise, one extra pin 20–200 px off in a random direction,
+a start camera up to 0.4 units, 4° and 13 mm focal away, all 7 parameters free, 60 trials each.
+Flagged means that pin and no other one:
+
+| | median focal error | 90 % | worst | trials > 1 % | wrong pin flagged |
+|---|---|---|---|---|---|
+| 6 + 1 pins, least squares | 8.0 % | 27 % | 88 % | 53 | 3 |
+| 6 + 1 pins, robust | 0.23 % | 0.55 % | 2.4 % | 3 | **60** |
+| 10 + 1 pins, least squares | 3.1 % | 11 % | 30 % | 50 | 33 |
+| 10 + 1 pins, robust | 0.07 % | 0.20 % | 0.43 % | 0 | **60** |
+
+With 6 + 1 pins, the robust result is within 0.014 % focal (median) of the 6 good pins solved
+alone, 0.86 % at worst; the 3 trials over 1 % are ones where the 6 good pins alone are that far
+off too (up to 2.2 %). On the same trials without the wrong pin, robust and least squares give the
+same camera.
+
+Designs that did not make it, same trials (6 + 1 pins, 40 of them): Huber weights, from the
+least-squares fit, with a threshold of 3 × median error: 28 trials over 1 %; Huber with a fixed
+2 px threshold: 16–18; Cauchy weights from the least-squares fit: 15. With 7 pins, least squares
+spreads the wrong pin's error over all of them. Starting Cauchy IRLS from the fit without the
+pin with the largest leave-one-out statistic brought it to 2. The weights that ship,
+min(1, (c/e)²), do as well (3 of 60 above) and leave pins that agree at least squares exactly.
+
+## Redraw cost (#19)
+
+Forced redraws (the 2D view nudged, then the framebuffer grabbed) with the 1M-triangle scan as
+the reference in Hidden Line, 100 pins on the frame, 3 of them outliers:
+
+| | redraw | `onDraw` (Python) | of that: pins / HUD |
+|---|---|---|---|
+| no pins | 19–22 ms | | |
+| 100 pins, before | 50 ms | 10.8 ms | 7.1 / 1.6 ms |
+| 100 pins, now | 51 ms | 9.2 ms | 6.1 / 0.9 ms |
+| 100 pins, now, labels not drawn (experiment) | 24.5 ms | | |
+
+The HUD solve is cached (a HUD update takes 0.56 ms instead of 0.95 ms), and the residual lines
+are built with four bulk calls instead of about 900 per-point HOM calls. The 100 pin labels
+(100 text draws) cost about 25 ms per redraw, almost all on the render side; the markers,
+anchor dots and residual lines about 5 ms.
 
 ## Acceptance criteria
 
@@ -132,9 +195,11 @@ OK
 | Locked parameters never change | PASS | Bit-identical values for every lock combination (headless); Lock Focal and Nodal presets during GUI drags |
 | Unlock all / delete all / per-frame delete work and are undoable | PASS | GUI test; asset buttons tested headless |
 | Pins and keys survive save and reopen | PASS | GUI test saves, clears, reloads and compares the pin JSON and every keyframe |
-| 6 good pins recover focal within about 1 % and position within a small tolerance | PASS | 0.13 % and 1.7 cm with 0.5 px click noise; exact without noise |
+| 6 good pins recover focal within about 1 % and position within a small tolerance | PASS | 0.07 % and 1.1 cm with 0.5 px click noise; exact without noise |
+| One wrong pin among 7 doesn't drag the camera and is flagged | PASS | GUI: 0.026 % focal, only that pin flagged; headless: as good as the 6 good pins alone, and 60 of 60 random trials flag only the wrong pin |
+| Lock Roll is exact | PASS | 1.3e-15 rad for five lock combinations; off (and shown in the HUD) within 5° of a straight up/down view |
 
-Other checks in the GUI test, all PASS (50 in total):
+Other checks in the GUI test, all PASS (57 in total):
 
 * Each create+drag and each drag is exactly one undo step, and one undo reverts pins and
   camera together.
@@ -152,6 +217,13 @@ Other checks in the GUI test, all PASS (50 in total):
   exit queued has run (an earlier version re-attached the view and hid the reference again).
 * Exclusions left behind by an earlier session are cleaned up, whether or not the node kept the
   user's mask.
+* The HUD hint rows name the tool's hotkey symbols, and every one of them has a key assigned
+  (`sv.hotkeyAssignments`); Delete Pin is bound to Del and Backspace.
+* The HUD's solver status is cached between redraws.
+* The HUD shows the roll lock as off for a camera looking straight down.
+* A flagged pin is drawn to the end of `onDraw` (red residual line, label), checked on the
+  rendered pixels. Exceptions in `onDraw` are silent: during this work a `TypeError` there went
+  unnoticed by every other check.
 
 ## Known gaps
 
@@ -162,4 +234,5 @@ Other checks in the GUI test, all PASS (50 in total):
   view space. So the raw dispatch still needs a check by hand:
   * Ctrl/⌘ + click
   * Space + drag
-  * the hotkeys, which are registered and assigned (`A K H C` checked)
+  * the hotkeys, which are registered and assigned (all checked with `hotkeyAssignments`). Delete
+    Pin is now a hotkey action as well; Del and Backspace still reach `onKeyEvent` first

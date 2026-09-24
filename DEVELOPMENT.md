@@ -17,7 +17,7 @@ in [PLAN.md](PLAN.md), and the measured results in [TESTLOG.md](TESTLOG.md).
 * **Verified:**
   * the camera model against Houdini's `worldTransform()` and `toNDC()`
   * the solver on synthetic ground truth
-  * every tool action through the live viewer state in a GUI session (50 checks), hidden-line
+  * every tool action through the live viewer state in a GUI session (57 checks), hidden-line
     removal on the rendered viewport pixels
   * ground-truth recovery on the rendered test scene
 * **Not verified: real OS mouse and keyboard input** (issue #1). Houdini's raw event dispatch
@@ -49,18 +49,34 @@ The viewer state reaches it as `node.hdaModule()`, and tests reach it by `import
     orthonormalised by SVD. That is what Houdini does for cameras.
   * `project`, `unproject` and `pixel_errors` work on those matrices.
   * Row-vector convention throughout, like `hou.Matrix4`.
-* **`solve(rig, P, UV, free, anchor, start, weight, lock_roll, focal_range, iters, polish)`**
+* **`solve(rig, P, UV, free, anchor, start, weight, lock_roll, focal_range, iters, polish, robust)`**
   returns `(q, info)`. It runs Levenberg–Marquardt on the free subset of `q`, with focal as
-  `log f` and a forward-difference Jacobian.
-  * **Residuals:** the pixel errors of the pins, a minimal-change prior toward `anchor` in
-    pixel equivalents, and optionally a stiff roll-lock term.
+  `log f` and a forward-difference Jacobian. `solve` decides the roll lock once and runs
+  `_solve` (one pass) `1 + polish` times.
+  * **Residuals:** the pixel errors of the pins, times the square roots of the pin weights, and
+    a minimal-change prior toward `anchor` in pixel equivalents.
+  * **Lock Roll** is an exact constraint, not a residual: LM steps are taken in the tangent
+    space of `roll(q) = roll(anchor)` (the null space of its gradient, `roll_basis`) and projected
+    back onto it by Newton (`on_roll`). Within `VERTICAL_DEG` (5°) of a straight up/down view
+    roll is undefined: the lock is off and `info["roll_off"]` says why.
+  * **Robust weights** (`robust`, once `2 × (pins − 1) > dof`, and only if some pin is over 2 px
+    off after least squares): 1 within c = max(2 px, 3 × median error), (c/e)² beyond, a
+    Cauchy-like tail, so a far-off pin stops pulling. The loss isn't convex, so the IRLS
+    (`lm(..., reweight=True)`, weights re-evaluated after every step) starts from the least-squares
+    fit without the pin with the largest linearised leave-one-out statistic `eᵀ(I − H)⁻¹e`
+    (`most_influential`). Starting from least squares keeps a pin the camera has yet to move to
+    (the one being dragged) from being rejected; the leave-one-out start is what makes it work
+    with 7 pins, where least squares spreads a bad pin's error over all of them and neither
+    Huber nor median-scaled IRLS from the least-squares fit found it (see TESTLOG).
   * **Tuning constants** (see PLAN.md for the reasoning):
     * λ = 2e-4 × `weight`
     * stiffness: pan/tilt 1, roll 8, zoom 8, dolly 40, truck/pedestal 120
     * `polish` re-anchors the prior at the result; 2 passes on commit, 0 while dragging
+    * `ROBUST_K`, `ROBUST_MIN_PX` (3, 2 px), `VERTICAL_DEG` (5°)
   * **`info`:** `status` comes from the numerical rank of the data Jacobian against the free
     degrees of freedom. `info` also carries `rms`, per-pin `errors` (NaN for pins behind the
-    camera), `n`, `behind`, `rank`, `dof` and `iterations`.
+    camera), `outliers` (error over twice the robust threshold), `redundant`, `roll_off`, `n`,
+    `behind`, `rank`, `dof` and `iterations` (of the last pass).
 * **Reference geometry:**
   * `polygons(geo)` returns `geo`, or an unpacked copy with polysoups converted, for the
     drawables, which take nothing but polygons.
@@ -139,8 +155,17 @@ The viewer state reaches it as `node.hdaModule()`, and tests reach it by `import
   3. the plate when it is over the geometry (just in front of the camera, at Plate Opacity)
   4. the pins (`_draw_pins`), then the HUD (`_update_hud`, which only pushes values that
      changed)
+* **Solver status for display:** `_evaluate(cam, pins)` is a zero-iteration `solve` at the
+  camera as it is (status, RMS, per-pin errors, outlier flags). The HUD and the pin colours
+  (outliers red) use it on every redraw, so it is cached under a key made of the active pins'
+  JSON, `pickle.dumps(vars(rig))` (the whole camera model), the free mask and the solver
+  options.
 * **Menu and hotkeys:** `_menu()` builds the RMB menu. `ACTIONS` lists the actions that have
-  hotkeys, registered through `viewerstate.utils.defineHotkey`.
+  hotkeys, registered through `viewerstate.utils.defineHotkey` (`_hotkey` gives the symbol).
+  HUD rows name their `actions`; `onEnter` turns them into `$symbol` references
+  (`su.hudModeHotkeyRefs`), which the HUD shows as the keys assigned now. Delete Pin is a
+  hotkey too (Del, Backspace), but `onKeyEvent` sees keys first and handles those two itself.
+  Deactivate Worst Pin has no default key.
 
 ### Asset internals (built by `build_hda.py`)
 
@@ -288,6 +313,12 @@ What I learned about testing a viewer state:
   `otls/camera_pin_matcher.hda*` before loading the scene (issue #2).
 * **`__file__` isn't defined** when Houdini runs a script given on the command line. Use
   `sys._getframe().f_code.co_filename`.
+* **Hotkeys** can only be checked in the GUI: `hou.PluginHotkeyDefinitions` raises NotAvailable in
+  hython. The GUI test reads the state module's globals (`HUD`, `ACTIONS`, `_hotkey`) as
+  `type(st).__init__.__globals__` and checks `SceneViewer.hotkeyAssignments`.
+* **Profiling redraws:** grabbing the framebuffer calls `onDraw` only if something changed.
+  Force a redraw (nudge the 2D view with `st._set_view`, then `refresh`) and `cProfile` sees
+  `onDraw` and everything below it.
 
 ## Houdini 22 behaviours worth knowing
 
@@ -348,8 +379,17 @@ What I learned about testing a viewer state:
 * `GeometryDrawable.setGeometry` raises "Advanced Drawables only support polygonal geometry"
   for packed primitives (and anything else that isn't polygons). `Geometry.intersect` works on
   packed prims and polysoups.
-* An exception anywhere in `onDraw` drops the draws that were queued before it. Nothing is
-  logged to stdout.
+* An exception in `onDraw` is silent: nothing is logged to stdout, and nothing after it is
+  drawn. (With the pins' `createPolygons` call raising, the markers queued before it still
+  showed.) `tests/test_gui.py` checks the pins' rendered pixels, the last thing drawn, for
+  that reason.
+* `Geometry.createPolygons(points, is_closed)` takes `is_closed` positionally only. The docs
+  show a keyword, but the binding is `(self, *args)`, so `is_closed=False` raises `TypeError`.
+* Text drawables are expensive: 100 pin labels add about 25 ms to a redraw, almost all of it on
+  the render side (100 markers, anchor dots and residual lines about 5 ms together).
+* HUD `key` strings can name hotkey symbols as `$<symbol>` (`su.hudHotkeyRef`,
+  `su.hudModeHotkeyRefs` for "A / L" rows); `hudInfo(template=..., update_hotkey_bindings=True)`
+  looks up the keys assigned now. `hudInfo(hud_values=...)` is deprecated; use `values=`.
 
 **Assets, scenes and the rest**
 * Embedded HDA states need the `ViewerStateInstall` and `ViewerStateUninstall` sections, or
@@ -391,14 +431,17 @@ All open work is tracked in the
 **Solver**
 * #5 Lens distortion
 * #6 Sequence solve: consistent focal, smoother keys
-* #7 Robust loss and bad-pin flagging
-* #8 Exact roll lock
+* #7 Robust loss and bad-pin flagging: implemented (Robust Solve, red outlier pins and HUD row,
+  Deactivate Worst Pin); close it once reviewed
+* #8 Exact roll lock: implemented (exact constraint, off within 5° of vertical); close it once
+  reviewed
 * #15 Look-at, constraints, rigs, orthographic cameras
 
 **Viewer state and UX**
 * #4 Native tumble lock instead of the view proxy (needs HOM from SideFX)
 * #12 Hover feedback, snap preview, keyboard nudging
-* #13 HUD/menu show the user's real hotkeys (good first issue)
+* #13 HUD/menu show the user's real hotkeys: implemented (HUD `$symbol` references, Delete Pin
+  is a hotkey); close it once reviewed
 * #14 Keyed and pinned frames on the timeline
 * #18 Depth-correct shaded mesh, hidden-line wireframe: implemented (Hidden Line, Hidden Line
   Ghost and Shaded displays); close it once reviewed
@@ -410,8 +453,9 @@ All open work is tracked in the
 
 **Performance**
 * #11 Plate caching, prefetch, proxy resolution, OCIO
-* #19 Per-redraw HUD solve and mesh rebuilds: the mesh is now prepared once per cook; the
-  per-redraw HUD solve and pin-marker geometry remain
+* #19 Per-redraw HUD solve and mesh rebuilds: the mesh is prepared once per cook, the HUD solve
+  is cached, the residual lines are built in bulk. Profiled with 100 pins on the 1M-triangle
+  scan (TESTLOG): what remains is Houdini drawing the pin labels, about 25 ms per redraw
 
 **Docs**
 * #21 Demo video and tutorial (after #1)

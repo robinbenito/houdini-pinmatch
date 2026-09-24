@@ -61,8 +61,16 @@ focal as `log f`, clamped to `[fmin, fmax]`):
    diagonal in px, `D` median pin depth, `λ = 2e-4`. Stiffness order pan/tilt < roll ≈ zoom < dolly < truck/pedestal gives:
    1 pin → pan/tilt; 2 pins → + roll + zoom (dolly if focal locked); 3+ → translation as needed.
    `λ` is small (fit dominates whenever the pins determine the camera).
-3. **Lock roll** (geometric, independent of rotate order): stiff residual on
-   `atan2(Xcam·up, Ycam·up)`.
+3. **Lock roll** (geometric, independent of rotate order): the constraint
+   `atan2(Xcam·up, Ycam·up) = roll(anchor)` is exact. LM steps are taken in its tangent space (the
+   null space of its gradient) and projected back onto it by Newton. It is off within 5° of a
+   straight up/down view, where roll is undefined. (First version: a stiff residual, 1e-8 rad.)
+4. **Robust weights** (issue #7), once the pins are redundant (leave any one out and the rest
+   still over-determine the camera): each pin's rows are scaled by `√wᵢ`,
+   `wᵢ = min(1, (c/eᵢ)²)` with `c = max(2 px, 3·median e)`: least squares for pins that agree,
+   and a far-off pin stops pulling. IRLS from the least-squares fit without the pin with the
+   largest linearised leave-one-out statistic `eₖᵀ(I − Hₖₖ)⁻¹eₖ`; with few pins, least squares
+   hides a bad pin by spreading its error, and Huber weights are too weak (TESTLOG).
 
 Guards: steps that push an active pin behind the camera are rejected; focal clamped; NaN → keep
 previous camera. Status from the numerical rank of the data Jacobian vs free DOF:

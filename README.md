@@ -103,7 +103,9 @@ hython tests/make_test_scene.py --no-render
    (**Solve & Key on Mouse Release**). The HUD shows the solver status and the RMS error.
 4. Use 4–6 or more well spread pins, at different depths if possible. Correct any pin by
    dragging it. Pins that are locked (**L**) can't be moved by accident. Pins that are inactive
-   (**A**) stay visible but are ignored by the solver.
+   (**A**) stay visible but are ignored by the solver. A red pin disagrees with the others (a
+   wrong corner or a slip) and hardly affects the camera: drag it onto its feature, or use
+   **Deactivate Worst Pin** in the RMB menu.
 5. **Rough matchmove:** go to another frame. The prompt offers the pins of the nearest pinned
    frame; press **C** to copy them (same ids, same 2D positions), then drag them onto the plate
    and release, or press **K**. Ghost pins (**G**) show where each pin was on the previous and
@@ -178,7 +180,8 @@ hython tests/make_test_scene.py --no-render
 ## Hotkeys
 
 The single-key actions are Houdini hotkey symbols in the tool's own context, so you can rebind
-them in the Hotkey Editor. On macOS, Houdini's **Ctrl** is the **⌘** key.
+them in the Hotkey Editor; the tool's hint panel and menu show the keys currently assigned.
+**Deactivate Worst Pin** has no default key. On macOS, Houdini's **Ctrl** is the **⌘** key.
 
 | Key | Action |
 |---|---|
@@ -195,7 +198,7 @@ them in the Hotkey Editor. On macOS, Houdini's **Ctrl** is the **⌘** key.
 | W | Next mesh display: wireframe → hidden line → hidden line ghost → shaded |
 | Mouse wheel / MMB drag | 2D zoom / pan of the view |
 | H | Reset the 2D view |
-| RMB | Tool menu: all the actions above, locks and presets, snapping mode, bulk pin operations, keyed frames |
+| RMB | Tool menu: all the actions above, **Deactivate Worst Pin** (the active pin with the largest error on this frame), locks and presets, snapping mode, bulk pin operations, keyed frames |
 
 ## Tool options (asset parameters)
 
@@ -219,10 +222,11 @@ them in the Hotkey Editor. On macOS, Houdini's **Ctrl** is the **⌘** key.
 | | Unlock All Pins / Deactivate All Pins | Apply to all frames. The RMB menu also has **Activate All** |
 | | Delete Pins on Current Frame / Delete All Pins... | **Delete All** asks for confirmation |
 | Solver | Lock TX TY TZ RX RY RZ Focal | Locked parameters are never changed by any solve |
-| | Lock Roll (horizon) | Keeps the camera's roll around its view axis, whatever the rotate order |
+| | Lock Roll (horizon) | Keeps the camera's roll around its view axis exactly, whatever the rotate order. Off for views within 5° of straight up or down, where roll is undefined; the HUD says so |
 | | Presets | Lock Focal/FOV · Nodal (Lock Position) · Lock Roll · Unlock All |
 | | Focal Range | The solved focal is clamped to this range (default 5–1000, camera focal units) |
 | | Minimal Change Weight | Strength of the pull toward the current camera (default 1). Higher keeps the camera steadier with few pins |
+| | Robust Solve | On by default. With pins to spare, a pin that disagrees with the others is down-weighted until it stops pulling, so one wrong pin can't drag the camera. Off: plain least squares. See [Solver](#solver) |
 | | Solve & Key on Mouse Release | When off, dragging updates the camera live and only **Solve & Key** sets keys |
 | | Solve & Key / Delete Keys on Current Frame / Keyed Frames... | **Keyed Frames...** lists keyed and pinned frames and jumps to the one you pick |
 
@@ -233,6 +237,7 @@ them in the Hotkey Editor. On macOS, Houdini's **Ctrl** is the **⌘** key.
 | green arrows | active pin |
 | grey | inactive pin (ignored by the solver) |
 | orange | locked pin (can't be dragged, still solved) |
+| red | outlier: its error is more than 6× the median pin error and at least 4 px (see [Solver](#solver)) |
 | yellow ring | selected pin |
 | purple, smaller | ghost pin from the previous or next pinned frame (label `id' (fN)`) |
 
@@ -246,6 +251,7 @@ The HUD shows:
   the minimal-change prior fills the rest), *solved* (exactly determined) or *over-constrained*
   (least squares)
 * the RMS reprojection error in pixels
+* the outlier pins with their errors, once there are enough pins to tell
 * the locked parameters, including protected ones
 * the focal length and horizontal FOV
 * the keyed frames
@@ -268,6 +274,17 @@ The HUD shows:
   pan/tilt < roll ≈ zoom < dolly < truck/pedestal. That order produces the few-pin behaviour
   described in the workflow. On release and on Solve & Key, a polish pass re-anchors the prior
   on the result, so a well-determined solve carries no prior bias.
+* **Robust solve** (on by default): once there are pins to spare (leave any one out and the rest
+  still over-determine the camera: 5 pins when nothing is locked), pins within 3× the median pin
+  error, and at least 2 px, count fully. A pin further off is down-weighted by
+  (threshold / error)², so a wrong pin stops pulling. With few pins, least squares spreads one bad
+  pin's error over all of them, so the robust fit starts from the solve without the pin whose
+  removal lowers the error most (a leave-one-out test). Pins that agree give exactly the
+  least-squares camera. A pin more than twice the threshold off is flagged: it turns red and the
+  HUD lists it. With 6 good pins and one on a neighbouring corner, least squares was 20 % off in
+  focal; the robust solve was as good as leaving the wrong pin out.
+* **Lock Roll** is an exact constraint: steps are taken along it and projected back onto it, so
+  the roll relative to world +Y stays unchanged to float precision (about 1e-15 rad).
 * **Guards:**
   * Steps that would put a pin behind the camera are rejected.
   * Focal is clamped to the Focal Range.
@@ -275,7 +292,8 @@ The HUD shows:
   * Look-at, constraints, non-perspective cameras and cameras inside locked assets disable
     solving.
 * **Speed:** about 5 ms per full solve with 30 pins. A live drag event, including camera writes,
-  takes about 2 ms.
+  takes about 2 ms. When there is a pin to down-weight, a drag event takes 5–10 ms and the solve
+  on release about 20 ms.
 
 ## Undo and safety
 
@@ -321,9 +339,10 @@ Pins are stored as JSON in the asset's hidden `pins` parameter, so they are save
 hython tests/test_core.py
 ```
 
-Camera model against Houdini, ground-truth recovery, locks, 1- and 2-pin behaviour, guards,
-protected parameters, asset buttons, undo, resolution matching, ray hits on Gaussian splats and
-point clouds, and the polygon conversion of packed and polysoup references.
+Camera model against Houdini, ground-truth recovery, locks (Lock Roll exact), 1- and 2-pin
+behaviour, a wrong pin among good ones, guards, protected parameters, asset buttons, undo,
+resolution matching, ray hits on Gaussian splats and point clouds, and the polygon conversion of
+packed and polysoup references.
 
 ```bash
 houdini -foreground tests/test_gui.py
@@ -359,16 +378,22 @@ work and ideas; the numbers below refer to them.
   reference meshes are displayed at the current frame, but existing anchors don't follow
   them (#9).
 * The solve uses only the pins of the current frame. There is no bundle adjustment across
-  frames (#6) and no lens distortion (#5). One bad pin pulls the whole solve (#7).
+  frames (#6) and no lens distortion (#5).
+* The robust solve needs pins to spare. With 4 pins or fewer (nothing locked), a wrong pin still
+  pulls the camera; its residual line shows it. When about half the pins disagree with the other
+  half, for example halfway through dragging copied pins onto a new frame, the camera follows the
+  group that fits better and can jump when that changes. Turn off **Robust Solve** for plain
+  least squares.
 * Hidden line draws the edges slightly toward the camera so they stay on top of their own
   faces. An edge less than about 0.2 % of its distance behind a surface can therefore still show.
 * Splat anchors are as accurate as the splat. Splats spill over object edges, and seen at a
   grazing angle a splat surface is a few millimetres thick, so pin well-defined features on
   surfaces that face the camera. The plate can't sit behind a semi-transparent splat: it is
   either behind it where the splat doesn't cover, or blended over it.
-* **Lock Roll** is a stiff constraint on the camera's roll relative to world +Y. It holds to
-  about 1e-8 rad but is not an exact elimination. It isn't defined for cameras looking straight
-  up or down (#8).
+* **Lock Roll** is off for views within 5° of straight up or down, where roll isn't defined. The
+  HUD then shows `roll (off: ...)`.
+* Pin labels are expensive to draw: with 100 pins on a frame, the labels add about 25 ms to each
+  redraw (Houdini's text drawing), the markers and residual lines about 5 ms.
 * The plate is loaded into memory per frame (about 60 ms for 1280×720), so scrubbing through
   4K plates is slow, and there is no OCIO view transform (#11).
 * The view proxy appears in the viewport's camera menu (#4).

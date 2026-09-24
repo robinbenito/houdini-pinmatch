@@ -90,6 +90,9 @@ def parm_templates():
         hou.FloatParmTemplate("minchange", "Minimal Change Weight", 1, default_value=(1.0,), min=0.01, max=100.0,
                               min_is_strict=True, help="Strength of the pull toward the camera's current state. "
                               "Higher = steadier camera with few pins, lower = follow pins more freely."),
+        toggle("robust", "Robust Solve (down-weight outlier pins)", True,
+               help="Once there are pins to spare (5 or more when nothing is locked), a pin that disagrees with "
+                    "the others is down-weighted, so one wrong pin can't drag the camera. Off: plain least squares."),
         toggle("autokey", "Solve & Key on Mouse Release", True,
                help="Off: dragging updates the camera live but keys are only set by Solve & Key."),
         hou.SeparatorParmTemplate("sep2"),
